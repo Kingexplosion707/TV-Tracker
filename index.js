@@ -16,6 +16,10 @@ http
   })
   .listen(PORT, () => console.log(`Keep-alive web server listening on port ${PORT}`));
 
+const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   pollAllGuilds();
