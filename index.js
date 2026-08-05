@@ -1,12 +1,20 @@
 require('dotenv').config();
+const http = require('http');
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const { loadData, saveData } = require('./storage');
 const { getUserByName, getRecentActivities } = require('./anilist');
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
 
-const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// Render (and most free hosts) expect something listening on a port to
+// consider the service "alive". This also gives an external ping service
+// (e.g. UptimeRobot) something to hit to keep the bot from sleeping.
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('AniList Discord bot is running.');
+  })
+  .listen(PORT, () => console.log(`Keep-alive web server listening on port ${PORT}`));
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AniList Activity Discord Bot
 
 Posts a Discord server's tracked AniList users' activity feed (episode/chapter progress, status updates) into a channel of your choice, automatically.
@@ -74,3 +75,7 @@ This bot stores tracked users in `data/storage.json` on disk. Railway's filesyst
 - `anilist.js` — talks to AniList's public GraphQL API (`https://graphql.anilist.co`), no API key needed.
 - `storage.js` — reads/writes `data/storage.json`, which tracks per-server: notification channel + list of `{ username, id, lastActivityId }`.
 - `index.js` — handles slash commands and runs a `setInterval` loop every `POLL_MINUTES` that fetches each tracked user's 10 most recent activities, filters for ones newer than `lastActivityId`, posts them as embeds oldest-first, and updates `lastActivityId`.
+=======
+# AniTracker
+A discord bot for Anilist.co to track users activity and send it to a server channel.
+>>>>>>> 1af0517fd6c1f0da59b5ab19d172f0052581052e
