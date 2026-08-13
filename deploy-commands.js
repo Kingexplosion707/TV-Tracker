@@ -21,6 +21,12 @@ const commands = [
     .addChannelOption((opt) =>
       opt.setName('channel').setDescription('Target text channel').setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('watchlater')
+    .setDescription('Show your personal watch later list (private, only you see it)'),
+  new SlashCommandBuilder()
+    .setName('recommendanimes')
+    .setDescription('Show the most-recommended anime/manga in this server, ranked highest to lowest'),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

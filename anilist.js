@@ -26,6 +26,7 @@ async function getUserByName(name) {
         id
         name
         siteUrl
+        avatar { medium }
       }
     }`;
   const data = await anilistQuery(query, { name });
@@ -44,9 +45,11 @@ async function getRecentActivities(userId, perPage = 10) {
             progress
             createdAt
             media {
+              id
               title { romaji english }
               siteUrl
-              coverImage { large medium }
+              description(asHtml: false)
+              coverImage { extraLarge large medium }
               type
             }
           }
@@ -69,4 +72,17 @@ async function getRecentActivities(userId, perPage = 10) {
   return data.data.Page.activities;
 }
 
-module.exports = { getUserByName, getRecentActivities };
+async function getMediaById(id) {
+  const query = `
+    query ($id: Int) {
+      Media(id: $id) {
+        id
+        title { romaji english }
+        siteUrl
+      }
+    }`;
+  const data = await anilistQuery(query, { id });
+  return data.data.Media;
+}
+
+module.exports = { getUserByName, getRecentActivities, getMediaById };
