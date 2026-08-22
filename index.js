@@ -3,17 +3,21 @@ const http = require('http');
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   EmbedBuilder,
   PermissionFlagsBits,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
 } = require('discord.js');
 const { loadData, saveData } = require('./storage');
-const { getUserByName, getRecentActivities, getMediaById } = require('./anilist');
+const { getUserByName, getRecentActivities, getMediaById, getUserFavorites } = require('./anilist');
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
+const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged for relaunch + reaction notices
+const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction lookups
 
 // Render (and most free hosts) expect something listening on a port to
 // consider the service "alive". This also gives an external ping service
@@ -26,24 +30,66 @@ http
   })
   .listen(PORT, () => console.log(`Keep-alive web server listening on port ${PORT}`));
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+});
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
   pollAllGuilds();
   setInterval(pollAllGuilds, POLL_INTERVAL_MS);
+  notifyRelaunch();
 });
 
 // Makes sure a guild's data object has every field newer features need,
 // even for guilds that were first tracked before those features existed.
 function ensureGuildData(data, guildId) {
   if (!data.guilds[guildId]) {
-    data.guilds[guildId] = { channelId: null, users: [], watchlist: {}, recommendations: {} };
+    data.guilds[guildId] = { channelId: null, users: [], watchlist: {}, recommendations: {}, recentPosts: {} };
   }
   const guildData = data.guilds[guildId];
   if (!guildData.watchlist) guildData.watchlist = {};
   if (!guildData.recommendations) guildData.recommendations = {};
+  if (!guildData.recentPosts) guildData.recentPosts = {};
   return guildData;
+}
+
+async function findAnimeRole(guild) {
+  try {
+    const roles = await guild.roles.fetch();
+    return roles.find((r) => r.name.toLowerCase() === ANIME_ROLE_NAME) || null;
+  } catch (e) {
+    console.error(`Failed to fetch roles for guild ${guild.id}:`, e.message);
+    return null;
+  }
+}
+
+// Pings the @Anime role in every configured channel once on startup, so
+// people know to re-track if a restart caused anything to look stale.
+async function notifyRelaunch() {
+  const data = loadData();
+  for (const guildId of Object.keys(data.guilds)) {
+    const guildData = ensureGuildData(data, guildId);
+    if (!guildData.channelId) continue;
+
+    try {
+      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      if (!guild) continue;
+      const channel = await client.channels.fetch(guildData.channelId).catch(() => null);
+      if (!channel) continue;
+
+      const animeRole = await findAnimeRole(guild);
+      if (!animeRole) continue; // no "Anime" role in this server, skip quietly
+
+      await channel.send({
+        content: `<@&${animeRole.id}> 🔄 AniTracker just restarted. If your activity feed looks stale, you may want to re-run \`/track\` for your profile.`,
+        allowedMentions: { roles: [animeRole.id] },
+      });
+    } catch (e) {
+      console.error(`Failed to send relaunch notice for guild ${guildId}:`, e.message);
+    }
+  }
 }
 
 client.on('interactionCreate', async (interaction) => {
@@ -51,6 +97,44 @@ client.on('interactionCreate', async (interaction) => {
     await handleSlashCommand(interaction);
   } else if (interaction.isButton()) {
     await handleButton(interaction);
+  }
+});
+
+// Notifies the tracked profile's owner (and pings @Anime) when someone
+// reacts to their activity post. Ignores reactions from other bots (e.g.
+// an auto-reacter bot that pre-populates reactions on every post) so those
+// don't trigger a notification.
+client.on('messageReactionAdd', async (reaction, reactingUser) => {
+  try {
+    if (reactingUser.bot) return; // ignores AutoReacter and any other bot's reactions
+
+    if (reaction.partial) {
+      const fetched = await reaction.fetch().catch(() => null);
+      if (!fetched) return;
+      reaction = fetched;
+    }
+
+    const message = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
+    if (!message || !message.guild || message.author?.id !== client.user.id) return;
+
+    const data = loadData();
+    const guildData = ensureGuildData(data, message.guild.id);
+    const postInfo = guildData.recentPosts[message.id];
+    if (!postInfo || !postInfo.addedBy) return;
+    if (reactingUser.id === postInfo.addedBy) return; // don't notify people about their own reaction
+
+    const animeRole = await findAnimeRole(message.guild);
+    const roleMention = animeRole ? `<@&${animeRole.id}> ` : '';
+    const animeNote = postInfo.animeTitle ? ` your watch of **${postInfo.animeTitle}**` : ' your watch';
+
+    await message.reply({
+      content: `${roleMention}<@${postInfo.addedBy}> ${reactingUser} reacted ${reaction.emoji.toString()} to${animeNote}!`,
+      allowedMentions: { users: [postInfo.addedBy], roles: animeRole ? [animeRole.id] : [] },
+      flags: MessageFlags.SuppressNotifications,
+      failIfNotExists: false,
+    });
+  } catch (e) {
+    console.error('Error handling reaction notification:', e.message);
   }
 });
 
@@ -79,6 +163,8 @@ async function handleSlashCommand(interaction) {
       handleWatchLaterList(interaction, guildData);
     } else if (commandName === 'recommendanimes') {
       handleRecommendAnimes(interaction, guildData);
+    } else if (commandName === 'favorites') {
+      await handleFavorites(interaction);
     }
   } catch (err) {
     console.error(`Error handling /${commandName}:`, err);
@@ -122,7 +208,7 @@ async function handleTrack(interaction, data, guildData) {
   saveData(data);
 
   await interaction.editReply(
-    `✅ Now tracking **${user.name}**'s AniList activity. New updates will post in <#${guildData.channelId}> and ping <@${interaction.user.id}>.`
+    `✅ Now tracking **${user.name}**'s AniList activity. New updates will post in <#${guildData.channelId}> and quietly ping <@${interaction.user.id}>.`
   );
 }
 
@@ -204,6 +290,51 @@ function handleRecommendAnimes(interaction, guildData) {
   interaction.reply({ embeds: [embed] });
 }
 
+async function handleFavorites(interaction) {
+  const username = interaction.options.getString('username');
+  await interaction.deferReply();
+
+  const user = await getUserFavorites(username).catch(() => null);
+  if (!user) {
+    await interaction.editReply(`Couldn't find an AniList user named **${username}**.`);
+    return;
+  }
+
+  const animeList = user.favourites?.anime?.nodes || [];
+  const mangaList = user.favourites?.manga?.nodes || [];
+
+  if (!animeList.length && !mangaList.length) {
+    await interaction.editReply(`**${user.name}** hasn't favorited anything on AniList yet.`);
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(DEFAULT_COLOR)
+    .setTitle(`💖 ${user.name}'s Favorites`)
+    .setURL(user.siteUrl);
+
+  if (animeList.length) {
+    embed.addFields({
+      name: '📺 Anime',
+      value: animeList
+        .map((m) => `• [${m.title.english || m.title.romaji}](${m.siteUrl})`)
+        .join('\n')
+        .slice(0, 1024),
+    });
+  }
+  if (mangaList.length) {
+    embed.addFields({
+      name: '📖 Manga',
+      value: mangaList
+        .map((m) => `• [${m.title.english || m.title.romaji}](${m.siteUrl})`)
+        .join('\n')
+        .slice(0, 1024),
+    });
+  }
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
 async function handleButton(interaction) {
   const guildId = interaction.guildId;
   if (!guildId) return;
@@ -282,12 +413,18 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
 
   saveData(data);
 
-  // Reflect the new count on the button itself, on the original message.
+  // Reflect the new count on the button AND the "Recommended by N people" footer line.
   try {
-    const newRow = buildActivityButtons(mediaId, rec.recommendedBy.length);
-    await interaction.message.edit({ components: [newRow] });
+    const newCount = rec.recommendedBy.length;
+    const newRow = buildActivityButtons(mediaId, newCount);
+    const existingEmbed = interaction.message.embeds[0];
+    const editPayload = { components: [newRow] };
+    if (existingEmbed) {
+      editPayload.embeds = [EmbedBuilder.from(existingEmbed).setFooter({ text: buildFooterText(newCount) })];
+    }
+    await interaction.message.edit(editPayload);
   } catch (e) {
-    console.error('Failed to update recommend button count:', e.message);
+    console.error('Failed to update recommend display:', e.message);
   }
 
   await interaction.editReply(
@@ -309,6 +446,15 @@ function buildActivityButtons(mediaId, recommendCount = 0) {
     .setStyle(ButtonStyle.Success);
 
   return new ActionRowBuilder().addComponents(watchLaterBtn, recommendBtn);
+}
+
+// Only mentions the recommend count when there's actually at least one — an
+// empty "Recommended by 0 people" line would just be clutter.
+function buildFooterText(recommendCount) {
+  if (recommendCount > 0) {
+    return `Recommended by ${recommendCount} ${recommendCount === 1 ? 'person' : 'people'} • AniList`;
+  }
+  return 'AniList';
 }
 
 function statusEmoji(status) {
@@ -355,13 +501,17 @@ function truncate(text, max) {
 }
 
 async function buildEmbed(username, avatarUrl, activity) {
-  const embed = new EmbedBuilder()
-    .setTimestamp(new Date(activity.createdAt * 1000))
-    .setFooter({ text: 'AniList' });
+  const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
 
-  const authorOpts = { name: `Profile ✦ ${username}`, url: `https://anilist.co/user/${username}` };
-  if (avatarUrl) authorOpts.iconURL = avatarUrl;
-  embed.setAuthor(authorOpts);
+  // Avatar shows via the small author icon; the "Profile ✦ username" text
+  // itself lives in the description instead (see profileLine below), since
+  // only description-level markdown lets us underline+link just the
+  // username without the "Profile ✦" prefix also becoming part of the link.
+  if (avatarUrl) {
+    embed.setAuthor({ name: '\u200b', iconURL: avatarUrl });
+  }
+
+  const profileLine = `Profile ✦ __[${username}](https://anilist.co/user/${username})__`;
 
   if (activity.__typename === 'ListActivity') {
     const title = activity.media.title.english || activity.media.title.romaji;
@@ -370,31 +520,56 @@ async function buildEmbed(username, avatarUrl, activity) {
     const color = await getDominantColor(displayImage);
     const synopsis = truncate(stripDescription(activity.media.description), 280);
     const rawStatus = (activity.status || 'updated').toLowerCase();
-    // Bold + linked + no underline only works inside the description field —
-    // Discord always underlines a title that has a URL attached, with no way to turn that off.
-    const statusLine = `*${rawStatus}* **[${title}](${activity.media.siteUrl})**`;
+
+    // The anime name is merged into the title so it renders at the same big
+    // size as the status text. Trade-off: because the whole title now has a
+    // link attached, Discord forces it to render underlined — there's no
+    // way to keep title-sized text clickable without that underline.
+    const bigTitle = `${statusEmoji(activity.status)} ${capitalize(rawStatus)}${
+      activity.progress ? ` ${activity.progress}` : ''
+    } • ${title}`;
+
+    const infoBits = [];
+    if (typeof activity.media.averageScore === 'number' && activity.media.averageScore !== null) {
+      infoBits.push(`⭐ ${(activity.media.averageScore / 10).toFixed(1)}/10`);
+    }
+    if (activity.media.genres && activity.media.genres.length) {
+      infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
+    }
+    const infoLine = infoBits.join('  •  ');
+
+    const descriptionParts = [profileLine];
+    if (synopsis) descriptionParts.push(synopsis);
+    if (infoLine) descriptionParts.push(infoLine);
 
     embed
       .setColor(color)
-      .setTitle(
-        `${statusEmoji(activity.status)} ${capitalize(rawStatus)}${activity.progress ? ` ${activity.progress}` : ''}`
-      )
-      .setDescription(synopsis ? `${statusLine}\n\n${synopsis}` : statusLine)
-      .setImage(displayImage);
+      .setTitle(bigTitle)
+      .setURL(activity.media.siteUrl)
+      .setDescription(descriptionParts.join('\n\n'))
+      .setImage(displayImage)
+      .setFooter({ text: buildFooterText(0) }); // fresh post, nobody's recommended it yet
   } else if (activity.__typename === 'TextActivity') {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a status update')
-      .setDescription(truncate(stripMarkup(activity.text), 300))
-      .setURL(activity.siteUrl);
+      .setURL(activity.siteUrl)
+      .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.text), 300)}`)
+      .setFooter({ text: 'AniList' });
   } else if (activity.__typename === 'MessageActivity') {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a message')
-      .setDescription(truncate(stripMarkup(activity.message), 300))
-      .setURL(activity.siteUrl);
+      .setURL(activity.siteUrl)
+      .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.message), 300)}`)
+      .setFooter({ text: 'AniList' });
   } else {
-    embed.setColor(DEFAULT_COLOR).setTitle('📺 New AniList activity').setURL(`https://anilist.co/user/${username}`);
+    embed
+      .setColor(DEFAULT_COLOR)
+      .setTitle('📺 New AniList activity')
+      .setURL(`https://anilist.co/user/${username}`)
+      .setDescription(profileLine)
+      .setFooter({ text: 'AniList' });
   }
   return embed;
 }
@@ -421,12 +596,25 @@ async function pollAllGuilds() {
           const components =
             activity.__typename === 'ListActivity' ? [buildActivityButtons(activity.media.id, 0)] : [];
 
-          await channel.send({
+          const sentMessage = await channel.send({
             content,
             embeds: [embed],
             components,
             allowedMentions: user.addedBy ? { users: [user.addedBy] } : undefined,
+            // Ping quietly: shows normally in the channel, but doesn't trigger
+            // a push notification/sound for the mentioned tracker.
+            flags: user.addedBy ? MessageFlags.SuppressNotifications : undefined,
           });
+
+          // Remember this post so a later reaction can be traced back to who to notify.
+          guildData.recentPosts[sentMessage.id] = {
+            addedBy: user.addedBy || null,
+            animeTitle:
+              activity.__typename === 'ListActivity'
+                ? activity.media.title.english || activity.media.title.romaji
+                : null,
+          };
+          changed = true;
         }
 
         if (newOnes.length) {
@@ -436,6 +624,17 @@ async function pollAllGuilds() {
       } catch (e) {
         console.error(`Failed polling ${user.username}:`, e.message);
       }
+    }
+
+    // Keep recentPosts from growing forever. Discord message IDs are
+    // snowflakes (roughly chronological, all-digit), so sorted key order
+    // here is effectively oldest-to-newest — trimming the front removes
+    // the oldest entries.
+    const postKeys = Object.keys(guildData.recentPosts);
+    if (postKeys.length > MAX_RECENT_POSTS) {
+      const excess = postKeys.length - MAX_RECENT_POSTS;
+      for (let i = 0; i < excess; i++) delete guildData.recentPosts[postKeys[i]];
+      changed = true;
     }
   }
 

@@ -27,6 +27,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('recommendanimes')
     .setDescription('Show the most-recommended anime/manga in this server, ranked highest to lowest'),
+  new SlashCommandBuilder()
+    .setName('favorites')
+    .setDescription("Show a user's AniList favorites")
+    .addStringOption((opt) =>
+      opt.setName('username').setDescription('AniList username').setRequired(true)
+    ),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

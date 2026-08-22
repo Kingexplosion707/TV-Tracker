@@ -50,6 +50,8 @@ async function getRecentActivities(userId, perPage = 10) {
               siteUrl
               description(asHtml: false)
               coverImage { extraLarge large medium }
+              averageScore
+              genres
               type
             }
           }
@@ -85,4 +87,25 @@ async function getMediaById(id) {
   return data.data.Media;
 }
 
-module.exports = { getUserByName, getRecentActivities, getMediaById };
+async function getUserFavorites(name) {
+  const query = `
+    query ($name: String) {
+      User(name: $name) {
+        id
+        name
+        siteUrl
+        favourites {
+          anime(perPage: 10) {
+            nodes { title { romaji english } siteUrl }
+          }
+          manga(perPage: 10) {
+            nodes { title { romaji english } siteUrl }
+          }
+        }
+      }
+    }`;
+  const data = await anilistQuery(query, { name });
+  return data.data.User;
+}
+
+module.exports = { getUserByName, getRecentActivities, getMediaById, getUserFavorites };
