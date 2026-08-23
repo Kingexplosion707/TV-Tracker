@@ -50,6 +50,7 @@ async function getRecentActivities(userId, perPage = 10) {
               siteUrl
               description(asHtml: false)
               coverImage { extraLarge large medium }
+              bannerImage
               averageScore
               genres
               type
