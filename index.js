@@ -16,8 +16,8 @@ const { getUserByName, getRecentActivities, getMediaById, getUserFavorites } = r
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
-const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged for relaunch + reaction notices
-const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction lookups
+const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on relaunch
+const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction/recommend lookups
 
 // Render (and most free hosts) expect something listening on a port to
 // consider the service "alive". This also gives an external ping service
@@ -100,13 +100,12 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Notifies the tracked profile's owner (and pings @Anime) when someone
-// reacts to their activity post. Ignores reactions from other bots (e.g.
-// an auto-reacter bot that pre-populates reactions on every post) so those
-// don't trigger a notification.
+// DMs the tracked profile's owner when someone reacts to their activity
+// post, and DMs the reactor a private confirmation that it happened.
+// Ignores reactions from any bot (covers an auto-reacter bot and similar).
 client.on('messageReactionAdd', async (reaction, reactingUser) => {
   try {
-    if (reactingUser.bot) return; // ignores AutoReacter and any other bot's reactions
+    if (reactingUser.bot) return;
 
     if (reaction.partial) {
       const fetched = await reaction.fetch().catch(() => null);
@@ -123,16 +122,29 @@ client.on('messageReactionAdd', async (reaction, reactingUser) => {
     if (!postInfo || !postInfo.addedBy) return;
     if (reactingUser.id === postInfo.addedBy) return; // don't notify people about their own reaction
 
-    const animeRole = await findAnimeRole(message.guild);
-    const roleMention = animeRole ? `<@&${animeRole.id}> ` : '';
-    const animeNote = postInfo.animeTitle ? ` your watch of **${postInfo.animeTitle}**` : ' your watch';
+    const emojiStr = reaction.emoji.toString();
+    const animeTitle = postInfo.animeTitle || 'their activity';
 
-    await message.reply({
-      content: `${roleMention}<@${postInfo.addedBy}> ${reactingUser} reacted ${reaction.emoji.toString()} to${animeNote}!`,
-      allowedMentions: { users: [postInfo.addedBy], roles: animeRole ? [animeRole.id] : [] },
-      flags: MessageFlags.SuppressNotifications,
-      failIfNotExists: false,
-    });
+    // Private DM to the profile owner: who reacted and to what.
+    try {
+      const owner = await client.users.fetch(postInfo.addedBy);
+      await owner.send({
+        content: `<@${reactingUser.id}> reacted ${emojiStr} to you watching **${animeTitle}**.`,
+        allowedMentions: { parse: [] },
+      });
+    } catch (e) {
+      console.error(`Failed to DM profile owner ${postInfo.addedBy}:`, e.message);
+    }
+
+    // Private DM to the reactor: confirms the alert went out, nobody else sees this.
+    try {
+      await reactingUser.send({
+        content: `<@${postInfo.addedBy}> was alerted of your reaction ${emojiStr} to **${animeTitle}**.`,
+        allowedMentions: { parse: [] },
+      });
+    } catch (e) {
+      console.error(`Failed to DM reactor ${reactingUser.id}:`, e.message);
+    }
   } catch (e) {
     console.error('Error handling reaction notification:', e.message);
   }
@@ -165,6 +177,8 @@ async function handleSlashCommand(interaction) {
       handleRecommendAnimes(interaction, guildData);
     } else if (commandName === 'favorites') {
       await handleFavorites(interaction);
+    } else if (commandName === 'whostracking') {
+      await handleWhosTracking(interaction, guildData);
     }
   } catch (err) {
     console.error(`Error handling /${commandName}:`, err);
@@ -235,6 +249,28 @@ function handleList(interaction, guildData) {
     .map((u) => `• ${u.username}${u.addedBy ? ` (pings <@${u.addedBy}>)` : ''}`)
     .join('\n');
   interaction.reply(`${channelLine}Tracking:\n${list}`);
+}
+
+// Same info as /list but with plain Discord display names instead of
+// mentions, so running it never pings anyone.
+async function handleWhosTracking(interaction, guildData) {
+  if (!guildData.users.length) {
+    await interaction.reply('Not tracking any AniList profiles yet.');
+    return;
+  }
+
+  const lines = await Promise.all(
+    guildData.users.map(async (u) => {
+      let trackerName = 'unknown';
+      if (u.addedBy) {
+        const member = await interaction.guild.members.fetch(u.addedBy).catch(() => null);
+        trackerName = member ? member.displayName : 'unknown';
+      }
+      return `• **${u.username}** — tracked by ${trackerName}`;
+    })
+  );
+
+  await interaction.reply(`📋 Who's Tracking What\n${lines.join('\n')}`);
 }
 
 function handleSetChannel(interaction, data, guildData) {
@@ -427,6 +463,23 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
     console.error('Failed to update recommend display:', e.message);
   }
 
+  // DM whoever's activity this was, telling them who recommended it — but only on a fresh recommend, not a removal.
+  if (!alreadyRecommended) {
+    try {
+      const postInfo = guildData.recentPosts[interaction.message.id];
+      if (postInfo && postInfo.addedBy && postInfo.addedBy !== userId) {
+        const owner = await client.users.fetch(postInfo.addedBy);
+        const animeName = rec.title || 'an anime';
+        await owner.send({
+          content: `<@${userId}> recommended **${animeName}** that you were watching!`,
+          allowedMentions: { parse: [] },
+        });
+      }
+    } catch (e) {
+      console.error('Failed to DM recommend notification:', e.message);
+    }
+  }
+
   await interaction.editReply(
     alreadyRecommended ? 'Removed your recommendation.' : 'Thanks for the recommendation! ⭐'
   );
@@ -473,6 +526,39 @@ function capitalize(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
+// Best-effort split of a trailing season indicator off the base title, e.g.
+// "Konosuba 3" -> { baseTitle: "Konosuba", season: 3 }. AniList has no
+// structured season field, so this is pattern-matching against the title
+// text itself — it'll catch the common naming styles but won't be perfect
+// for every show, especially ones whose real title just happens to end in
+// a number (e.g. "86", "91 Days").
+function splitTitleAndSeason(rawTitle) {
+  const namedPatterns = [
+    /^(.*?)\s+(\d+)(?:st|nd|rd|th)\s+Season$/i,
+    /^(.*?)\s+Season\s+(\d+)$/i,
+    /^(.*?)\s+Part\s+(\d+)$/i,
+  ];
+  for (const pattern of namedPatterns) {
+    const m = rawTitle.match(pattern);
+    if (m) return { baseTitle: m[1].trim(), season: parseInt(m[2], 10) };
+  }
+
+  const romanMap = { II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
+  const romanMatch = rawTitle.match(/^(.*?)\s+(II|III|IV|V|VI|VII|VIII|IX|X)$/);
+  if (romanMatch && romanMap[romanMatch[2]]) {
+    return { baseTitle: romanMatch[1].trim(), season: romanMap[romanMatch[2]] };
+  }
+
+  // Bare trailing number, e.g. "Kaguya-sama wa Kokurasetai 3" — only treated
+  // as a season if it's a small number, to avoid misfiring on titles like "86".
+  const bareMatch = rawTitle.match(/^(.*?)\s+(\d{1,2})$/);
+  if (bareMatch && parseInt(bareMatch[2], 10) <= 9 && bareMatch[1].trim().length > 2) {
+    return { baseTitle: bareMatch[1].trim(), season: parseInt(bareMatch[2], 10) };
+  }
+
+  return { baseTitle: rawTitle, season: null };
+}
+
 function stripMarkup(text) {
   return (text || '')
     .replace(/img\d*\(.*?\)/g, '')
@@ -503,50 +589,54 @@ function truncate(text, max) {
 async function buildEmbed(username, avatarUrl, activity) {
   const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
 
-  // Avatar shows via the small author icon; the "Profile ✦ username" text
-  // itself lives in the description instead (see profileLine below), since
-  // only description-level markdown lets us underline+link just the
-  // username without the "Profile ✦" prefix also becoming part of the link.
-  if (avatarUrl) {
-    embed.setAuthor({ name: '\u200b', iconURL: avatarUrl });
-  }
-
-  const profileLine = `Profile ✦ __[${username}](https://anilist.co/user/${username})__`;
+  const authorOpts = { name: `✦ ${username}`, url: `https://anilist.co/user/${username}` };
+  if (avatarUrl) authorOpts.iconURL = avatarUrl;
+  embed.setAuthor(authorOpts);
 
   if (activity.__typename === 'ListActivity') {
-    const title = activity.media.title.english || activity.media.title.romaji;
-    const displayImage =
-      activity.media.coverImage.extraLarge || activity.media.coverImage.large || activity.media.coverImage.medium;
-    const color = await getDominantColor(displayImage);
-    const synopsis = truncate(stripDescription(activity.media.description), 280);
+    const rawTitle = activity.media.title.english || activity.media.title.romaji;
+    const { baseTitle, season } = splitTitleAndSeason(rawTitle);
     const rawStatus = (activity.status || 'updated').toLowerCase();
 
-    // The anime name is merged into the title so it renders at the same big
-    // size as the status text. Trade-off: because the whole title now has a
-    // link attached, Discord forces it to render underlined — there's no
-    // way to keep title-sized text clickable without that underline.
-    const bigTitle = `${statusEmoji(activity.status)} ${capitalize(rawStatus)}${
-      activity.progress ? ` ${activity.progress}` : ''
-    } • ${title}`;
+    // Emoji at the end of the status line, season/episode on their own line below.
+    const titleLine1 = `${capitalize(rawStatus)} ${baseTitle} ${statusEmoji(activity.status)}`;
+    const subParts = [];
+    if (season) subParts.push(`Season ${season}`);
+    if (activity.progress) subParts.push(`Episode ${activity.progress}`);
+    const titleLine2 = subParts.join(', ');
 
-    const infoBits = [];
+    // Title stays unlinked on purpose: Discord only allows ONE link for the
+    // whole title field, and we want just the anime name (below, in the
+    // description) to be clickable — not the "watched"/"completed" word.
+    embed.setTitle(titleLine2 ? `${titleLine1}\n${titleLine2}` : titleLine1);
+
+    // A landscape banner (if AniList has one) closes the side gap a portrait
+    // cover leaves in the embed — Discord never stretches images to fill
+    // width, so a wider source image is the only real fix for that gap.
+    const displayImage =
+      activity.media.bannerImage ||
+      activity.media.coverImage.extraLarge ||
+      activity.media.coverImage.large ||
+      activity.media.coverImage.medium;
+    const color = await getDominantColor(displayImage);
+
+    const synopsis = truncate(stripDescription(activity.media.description), 160);
+    const linkLine = `**[${baseTitle}](${activity.media.siteUrl})**`;
+    embed.setDescription(synopsis ? `${linkLine}\n\n${synopsis}` : linkLine);
+
     if (typeof activity.media.averageScore === 'number' && activity.media.averageScore !== null) {
-      infoBits.push(`⭐ ${(activity.media.averageScore / 10).toFixed(1)}/10`);
+      embed.addFields({
+        name: '⭐ Rating',
+        value: `${(activity.media.averageScore / 10).toFixed(1)}/10`,
+        inline: true,
+      });
     }
     if (activity.media.genres && activity.media.genres.length) {
-      infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
+      embed.addFields({ name: '🎭 Genres', value: activity.media.genres.slice(0, 3).join(', '), inline: true });
     }
-    const infoLine = infoBits.join('  •  ');
-
-    const descriptionParts = [profileLine];
-    if (synopsis) descriptionParts.push(synopsis);
-    if (infoLine) descriptionParts.push(infoLine);
 
     embed
       .setColor(color)
-      .setTitle(bigTitle)
-      .setURL(activity.media.siteUrl)
-      .setDescription(descriptionParts.join('\n\n'))
       .setImage(displayImage)
       .setFooter({ text: buildFooterText(0) }); // fresh post, nobody's recommended it yet
   } else if (activity.__typename === 'TextActivity') {
@@ -554,21 +644,20 @@ async function buildEmbed(username, avatarUrl, activity) {
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a status update')
       .setURL(activity.siteUrl)
-      .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.text), 300)}`)
+      .setDescription(truncate(stripMarkup(activity.text), 300))
       .setFooter({ text: 'AniList' });
   } else if (activity.__typename === 'MessageActivity') {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a message')
       .setURL(activity.siteUrl)
-      .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.message), 300)}`)
+      .setDescription(truncate(stripMarkup(activity.message), 300))
       .setFooter({ text: 'AniList' });
   } else {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('📺 New AniList activity')
       .setURL(`https://anilist.co/user/${username}`)
-      .setDescription(profileLine)
       .setFooter({ text: 'AniList' });
   }
   return embed;
@@ -606,7 +695,7 @@ async function pollAllGuilds() {
             flags: user.addedBy ? MessageFlags.SuppressNotifications : undefined,
           });
 
-          // Remember this post so a later reaction can be traced back to who to notify.
+          // Remember this post so a later reaction/recommend can be traced back to who to notify.
           guildData.recentPosts[sentMessage.id] = {
             addedBy: user.addedBy || null,
             animeTitle:

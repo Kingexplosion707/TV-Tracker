@@ -33,6 +33,9 @@ const commands = [
     .addStringOption((opt) =>
       opt.setName('username').setDescription('AniList username').setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('whostracking')
+    .setDescription('List who is being tracked and by whom, without pinging anyone'),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
