@@ -522,6 +522,23 @@ function statusEmoji(status) {
   return '📺';
 }
 
+// A clean, standalone verb for the small lead-in line — independent of
+// AniList's raw status phrasing, so it combines predictably with our own
+// "Season X, Episode Y" wording instead of risking duplicate words like
+// "watched episode Episode 5".
+function statusVerbShort(status) {
+  const s = (status || '').toLowerCase();
+  if (s.includes('complet')) return 'Completed';
+  if (s.includes('drop')) return 'Dropped';
+  if (s.includes('paus')) return 'Paused';
+  if (s.includes('plan')) return 'Plans to watch';
+  if (s.includes('rewatch')) return 'Rewatched';
+  if (s.includes('reread')) return 'Reread';
+  if (s.includes('watch')) return 'Watched';
+  if (s.includes('read')) return 'Read';
+  return capitalize(s) || 'Updated';
+}
+
 function capitalize(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
@@ -586,79 +603,83 @@ function truncate(text, max) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-async function buildEmbed(username, avatarUrl, activity) {
+async function buildEmbed(username, avatarUrl, activity, streak) {
   const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
-
-  const authorOpts = { name: `✦ ${username}`, url: `https://anilist.co/user/${username}` };
-  if (avatarUrl) authorOpts.iconURL = avatarUrl;
-  embed.setAuthor(authorOpts);
 
   if (activity.__typename === 'ListActivity') {
     const rawTitle = activity.media.title.english || activity.media.title.romaji;
     const { baseTitle, season } = splitTitleAndSeason(rawTitle);
-    const rawStatus = (activity.status || 'updated').toLowerCase();
 
-    // Emoji at the end of the status line, season/episode on their own line below.
-    const titleLine1 = `${capitalize(rawStatus)} ${baseTitle} ${statusEmoji(activity.status)}`;
+    // Author renders smaller/muted by Discord's own default styling — no
+    // markdown needed — which is the only way to get genuinely small text
+    // ABOVE the title. So the "Watched Episode 5 of:" lead-in lives here.
     const subParts = [];
     if (season) subParts.push(`Season ${season}`);
     if (activity.progress) subParts.push(`Episode ${activity.progress}`);
-    const titleLine2 = subParts.join(', ');
+    const progressSuffix = subParts.join(', ');
+    const leadInText = progressSuffix
+      ? `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)} ${progressSuffix} of:`
+      : `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)}:`;
+    const authorOpts = { name: leadInText };
+    if (avatarUrl) authorOpts.iconURL = avatarUrl;
+    embed.setAuthor(authorOpts);
 
-    // Title stays unlinked on purpose: Discord only allows ONE link for the
-    // whole title field, and we want just the anime name (below, in the
-    // description) to be clickable — not the "watched"/"completed" word.
-    embed.setTitle(titleLine2 ? `${titleLine1}\n${titleLine2}` : titleLine1);
+    // Title holds ONLY the anime name, linked, full size — nothing else.
+    embed.setTitle(baseTitle).setURL(activity.media.siteUrl);
 
-    // A landscape banner (if AniList has one) closes the side gap a portrait
-    // cover leaves in the embed — Discord never stretches images to fill
-    // width, so a wider source image is the only real fix for that gap.
+    // Back to the portrait cover art (largest AniList provides — there's no
+    // size above "extraLarge" to request, so this is already maxed out).
     const displayImage =
-      activity.media.bannerImage ||
-      activity.media.coverImage.extraLarge ||
-      activity.media.coverImage.large ||
-      activity.media.coverImage.medium;
+      activity.media.coverImage.extraLarge || activity.media.coverImage.large || activity.media.coverImage.medium;
     const color = await getDominantColor(displayImage);
 
-    const synopsis = truncate(stripDescription(activity.media.description), 160);
-    const linkLine = `**[${baseTitle}](${activity.media.siteUrl})**`;
-    embed.setDescription(synopsis ? `${linkLine}\n\n${synopsis}` : linkLine);
-
+    const infoBits = [];
     if (typeof activity.media.averageScore === 'number' && activity.media.averageScore !== null) {
-      embed.addFields({
-        name: '⭐ Rating',
-        value: `${(activity.media.averageScore / 10).toFixed(1)}/10`,
-        inline: true,
-      });
+      infoBits.push(`⭐ ${(activity.media.averageScore / 10).toFixed(1)}/10`);
     }
     if (activity.media.genres && activity.media.genres.length) {
-      embed.addFields({ name: '🎭 Genres', value: activity.media.genres.slice(0, 3).join(', '), inline: true });
+      infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
     }
+    if (activity.media.isAdult) infoBits.push('🔞 18+');
+    const infoLine = infoBits.join('  •  ');
+
+    const synopsis = truncate(stripDescription(activity.media.description), 160);
+
+    const descParts = [`✦ ${username}  •  🔥 ${streak || 1}`];
+    if (infoLine) descParts.push(infoLine);
+    if (synopsis) descParts.push(synopsis);
+    embed.setDescription(descParts.join('\n\n'));
 
     embed
       .setColor(color)
       .setImage(displayImage)
       .setFooter({ text: buildFooterText(0) }); // fresh post, nobody's recommended it yet
-  } else if (activity.__typename === 'TextActivity') {
-    embed
-      .setColor(DEFAULT_COLOR)
-      .setTitle('💬 Posted a status update')
-      .setURL(activity.siteUrl)
-      .setDescription(truncate(stripMarkup(activity.text), 300))
-      .setFooter({ text: 'AniList' });
-  } else if (activity.__typename === 'MessageActivity') {
-    embed
-      .setColor(DEFAULT_COLOR)
-      .setTitle('💬 Posted a message')
-      .setURL(activity.siteUrl)
-      .setDescription(truncate(stripMarkup(activity.message), 300))
-      .setFooter({ text: 'AniList' });
   } else {
-    embed
-      .setColor(DEFAULT_COLOR)
-      .setTitle('📺 New AniList activity')
-      .setURL(`https://anilist.co/user/${username}`)
-      .setFooter({ text: 'AniList' });
+    if (avatarUrl) embed.setAuthor({ name: '\u200b', iconURL: avatarUrl });
+    const profileLine = `✦ ${username}  •  🔥 ${streak || 1}`;
+
+    if (activity.__typename === 'TextActivity') {
+      embed
+        .setColor(DEFAULT_COLOR)
+        .setTitle('💬 Posted a status update')
+        .setURL(activity.siteUrl)
+        .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.text), 300)}`)
+        .setFooter({ text: 'AniList' });
+    } else if (activity.__typename === 'MessageActivity') {
+      embed
+        .setColor(DEFAULT_COLOR)
+        .setTitle('💬 Posted a message')
+        .setURL(activity.siteUrl)
+        .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.message), 300)}`)
+        .setFooter({ text: 'AniList' });
+    } else {
+      embed
+        .setColor(DEFAULT_COLOR)
+        .setTitle('📺 New AniList activity')
+        .setURL(`https://anilist.co/user/${username}`)
+        .setDescription(profileLine)
+        .setFooter({ text: 'AniList' });
+    }
   }
   return embed;
 }
@@ -679,8 +700,20 @@ async function pollAllGuilds() {
         const activities = await getRecentActivities(user.id, 10);
         const newOnes = activities.filter((a) => a.id > user.lastActivityId).sort((a, b) => a.id - b.id);
 
+        // Daily streak: counts up if there was activity yesterday and today,
+        // resets to 1 if a day was skipped. Computed once per poll batch
+        // (not per activity) so multiple updates in one day don't double-count.
+        if (newOnes.length) {
+          const today = new Date().toISOString().slice(0, 10);
+          if (user.lastActivityDate !== today) {
+            const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+            user.streak = user.lastActivityDate === yesterday ? (user.streak || 0) + 1 : 1;
+            user.lastActivityDate = today;
+          }
+        }
+
         for (const activity of newOnes) {
-          const embed = await buildEmbed(user.username, user.avatar, activity);
+          const embed = await buildEmbed(user.username, user.avatar, activity, user.streak);
           const content = user.addedBy ? `<@${user.addedBy}>` : undefined;
           const components =
             activity.__typename === 'ListActivity' ? [buildActivityButtons(activity.media.id, 0)] : [];
