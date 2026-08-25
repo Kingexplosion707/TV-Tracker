@@ -53,6 +53,7 @@ async function getRecentActivities(userId, perPage = 10) {
               bannerImage
               averageScore
               genres
+              isAdult
               type
             }
           }
