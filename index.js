@@ -12,12 +12,23 @@ const {
   MessageFlags,
 } = require('discord.js');
 const { loadData, saveData } = require('./storage');
-const { getUserByName, getRecentActivities, getMediaById, getUserFavorites } = require('./anilist');
+const {
+  getUserByName,
+  getRecentActivities,
+  getMediaById,
+  getUserFavorites,
+  getMediaRelations,
+} = require('./anilist');
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
 const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on relaunch
 const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction/recommend lookups
+const MAX_SEASON_HOPS = 5; // safety cap on how far back we'll walk a prequel chain
+
+// In-memory cache of mediaId -> season number, so we only ever walk a given
+// show's prequel chain once per bot process lifetime, not on every poll.
+const seasonCache = new Map();
 
 // Render (and most free hosts) expect something listening on a port to
 // consider the service "alive". This also gives an external ping service
@@ -68,7 +79,7 @@ async function findAnimeRole(guild) {
 // Pings the @Anime role in every configured channel once on startup, so
 // people know to re-track if a restart caused anything to look stale.
 async function notifyRelaunch() {
-  const data = loadData();
+  const data = await loadData();
   for (const guildId of Object.keys(data.guilds)) {
     const guildData = ensureGuildData(data, guildId);
     if (!guildData.channelId) continue;
@@ -116,7 +127,7 @@ client.on('messageReactionAdd', async (reaction, reactingUser) => {
     const message = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
     if (!message || !message.guild || message.author?.id !== client.user.id) return;
 
-    const data = loadData();
+    const data = await loadData();
     const guildData = ensureGuildData(data, message.guild.id);
     const postInfo = guildData.recentPosts[message.id];
     if (!postInfo || !postInfo.addedBy) return;
@@ -159,18 +170,18 @@ async function handleSlashCommand(interaction) {
     return;
   }
 
-  const data = loadData();
+  const data = await loadData();
   const guildData = ensureGuildData(data, guildId);
 
   try {
     if (commandName === 'track') {
       await handleTrack(interaction, data, guildData);
     } else if (commandName === 'untrack') {
-      handleUntrack(interaction, data, guildData);
+      await handleUntrack(interaction, data, guildData);
     } else if (commandName === 'list') {
       handleList(interaction, guildData);
     } else if (commandName === 'setchannel') {
-      handleSetChannel(interaction, data, guildData);
+      await handleSetChannel(interaction, data, guildData);
     } else if (commandName === 'watchlater') {
       handleWatchLaterList(interaction, guildData);
     } else if (commandName === 'recommendanimes') {
@@ -219,18 +230,18 @@ async function handleTrack(interaction, data, guildData) {
     avatar: user.avatar?.medium || null,
   });
   if (!guildData.channelId) guildData.channelId = interaction.channelId;
-  saveData(data);
+  await saveData(data);
 
   await interaction.editReply(
     `✅ Now tracking **${user.name}**'s AniList activity. New updates will post in <#${guildData.channelId}> and quietly ping <@${interaction.user.id}>.`
   );
 }
 
-function handleUntrack(interaction, data, guildData) {
+async function handleUntrack(interaction, data, guildData) {
   const username = interaction.options.getString('username');
   const before = guildData.users.length;
   guildData.users = guildData.users.filter((u) => u.username.toLowerCase() !== username.toLowerCase());
-  saveData(data);
+  await saveData(data);
 
   if (guildData.users.length < before) {
     interaction.reply(`🗑️ Stopped tracking **${username}**.`);
@@ -273,14 +284,14 @@ async function handleWhosTracking(interaction, guildData) {
   await interaction.reply(`📋 Who's Tracking What\n${lines.join('\n')}`);
 }
 
-function handleSetChannel(interaction, data, guildData) {
+async function handleSetChannel(interaction, data, guildData) {
   if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
     interaction.reply({ content: 'You need the Manage Server permission to do that.', ephemeral: true });
     return;
   }
   const channel = interaction.options.getChannel('channel');
   guildData.channelId = channel.id;
-  saveData(data);
+  await saveData(data);
   interaction.reply(`AniList updates will now post in <#${channel.id}>.`);
 }
 
@@ -379,7 +390,7 @@ async function handleButton(interaction) {
   const mediaId = parseInt(mediaIdStr, 10);
   if (!mediaId) return;
 
-  const data = loadData();
+  const data = await loadData();
   const guildData = ensureGuildData(data, guildId);
 
   try {
@@ -407,7 +418,7 @@ async function handleWatchLaterButton(interaction, data, guildData, mediaId) {
 
   if (existingIndex !== -1) {
     list.splice(existingIndex, 1);
-    saveData(data);
+    await saveData(data);
     await interaction.reply({ content: '🗑️ Removed from your watch later list.', ephemeral: true });
     return;
   }
@@ -420,7 +431,7 @@ async function handleWatchLaterButton(interaction, data, guildData, mediaId) {
   }
   const title = media.title.english || media.title.romaji;
   list.push({ mediaId, title, siteUrl: media.siteUrl });
-  saveData(data);
+  await saveData(data);
   await interaction.editReply(`📌 Added **${title}** to your watch later list.`);
 }
 
@@ -447,7 +458,7 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
     rec.recommendedBy.push(userId);
   }
 
-  saveData(data);
+  await saveData(data);
 
   // Reflect the new count on the button AND the "Recommended by N people" footer line.
   try {
@@ -522,10 +533,9 @@ function statusEmoji(status) {
   return '📺';
 }
 
-// A clean, standalone verb for the small lead-in line — independent of
-// AniList's raw status phrasing, so it combines predictably with our own
-// "Season X, Episode Y" wording instead of risking duplicate words like
-// "watched episode Episode 5".
+// A clean, standalone verb for the caption line under the title —
+// independent of AniList's raw status phrasing, so it combines predictably
+// with our own "Season X, Episode Y" wording.
 function statusVerbShort(status) {
   const s = (status || '').toLowerCase();
   if (s.includes('complet')) return 'Completed';
@@ -543,37 +553,30 @@ function capitalize(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-// Best-effort split of a trailing season indicator off the base title, e.g.
-// "Konosuba 3" -> { baseTitle: "Konosuba", season: 3 }. AniList has no
-// structured season field, so this is pattern-matching against the title
-// text itself — it'll catch the common naming styles but won't be perfect
-// for every show, especially ones whose real title just happens to end in
-// a number (e.g. "86", "91 Days").
-function splitTitleAndSeason(rawTitle) {
-  const namedPatterns = [
-    /^(.*?)\s+(\d+)(?:st|nd|rd|th)\s+Season$/i,
-    /^(.*?)\s+Season\s+(\d+)$/i,
-    /^(.*?)\s+Part\s+(\d+)$/i,
-  ];
-  for (const pattern of namedPatterns) {
-    const m = rawTitle.match(pattern);
-    if (m) return { baseTitle: m[1].trim(), season: parseInt(m[2], 10) };
+// Walks AniList's actual PREQUEL relation chain to find a real season
+// number — correct even when each season has a completely different title
+// (unlike guessing from title text). Capped at MAX_SEASON_HOPS API calls
+// per uncached show, and cached in-memory afterward so a show's season
+// number is only ever resolved once per bot process lifetime.
+async function resolveSeasonNumber(mediaId) {
+  if (seasonCache.has(mediaId)) return seasonCache.get(mediaId);
+
+  let season = 1;
+  let cursorId = mediaId;
+
+  for (let hop = 0; hop < MAX_SEASON_HOPS; hop++) {
+    const media = await getMediaRelations(cursorId).catch(() => null);
+    const edges = media?.relations?.edges;
+    if (!edges) break;
+    const prequel = edges.find((e) => e.relationType === 'PREQUEL');
+    if (!prequel) break;
+    season += 1;
+    cursorId = prequel.node.id;
   }
 
-  const romanMap = { II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10 };
-  const romanMatch = rawTitle.match(/^(.*?)\s+(II|III|IV|V|VI|VII|VIII|IX|X)$/);
-  if (romanMatch && romanMap[romanMatch[2]]) {
-    return { baseTitle: romanMatch[1].trim(), season: romanMap[romanMatch[2]] };
-  }
-
-  // Bare trailing number, e.g. "Kaguya-sama wa Kokurasetai 3" — only treated
-  // as a season if it's a small number, to avoid misfiring on titles like "86".
-  const bareMatch = rawTitle.match(/^(.*?)\s+(\d{1,2})$/);
-  if (bareMatch && parseInt(bareMatch[2], 10) <= 9 && bareMatch[1].trim().length > 2) {
-    return { baseTitle: bareMatch[1].trim(), season: parseInt(bareMatch[2], 10) };
-  }
-
-  return { baseTitle: rawTitle, season: null };
+  const result = season > 1 ? season : null;
+  seasonCache.set(mediaId, result);
+  return result;
 }
 
 function stripMarkup(text) {
@@ -606,29 +609,30 @@ function truncate(text, max) {
 async function buildEmbed(username, avatarUrl, activity, streak) {
   const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
 
-  if (activity.__typename === 'ListActivity') {
-    const rawTitle = activity.media.title.english || activity.media.title.romaji;
-    const { baseTitle, season } = splitTitleAndSeason(rawTitle);
+  const authorOpts = { name: `✦ ${username}  •  🔥 ${streak || 1}`, url: `https://anilist.co/user/${username}` };
+  if (avatarUrl) authorOpts.iconURL = avatarUrl;
+  embed.setAuthor(authorOpts);
 
-    // Author renders smaller/muted by Discord's own default styling — no
-    // markdown needed — which is the only way to get genuinely small text
-    // ABOVE the title. So the "Watched Episode 5 of:" lead-in lives here.
+  if (activity.__typename === 'ListActivity') {
+    const title = activity.media.title.english || activity.media.title.romaji;
+    const season = await resolveSeasonNumber(activity.media.id);
+
+    // "# " header markdown renders bigger than embed Title styling and,
+    // unlike Title, supports being a link without forcing an underline —
+    // so the big clickable anime name lives here in the description,
+    // not in the actual embed Title field (left unused for this type).
+    const headerLine = `# [${title}](${activity.media.siteUrl})`;
+
     const subParts = [];
     if (season) subParts.push(`Season ${season}`);
     if (activity.progress) subParts.push(`Episode ${activity.progress}`);
     const progressSuffix = subParts.join(', ');
-    const leadInText = progressSuffix
-      ? `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)} ${progressSuffix} of:`
-      : `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)}:`;
-    const authorOpts = { name: leadInText };
-    if (avatarUrl) authorOpts.iconURL = avatarUrl;
-    embed.setAuthor(authorOpts);
+    const captionLine = progressSuffix
+      ? `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)} ${progressSuffix}`
+      : `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)}`;
 
-    // Title holds ONLY the anime name, linked, full size — nothing else.
-    embed.setTitle(baseTitle).setURL(activity.media.siteUrl);
-
-    // Back to the portrait cover art (largest AniList provides — there's no
-    // size above "extraLarge" to request, so this is already maxed out).
+    // Portrait cover art — already the largest size AniList provides
+    // ("extraLarge"), there's no higher resolution to request above this.
     const displayImage =
       activity.media.coverImage.extraLarge || activity.media.coverImage.large || activity.media.coverImage.medium;
     const color = await getDominantColor(displayImage);
@@ -640,12 +644,12 @@ async function buildEmbed(username, avatarUrl, activity, streak) {
     if (activity.media.genres && activity.media.genres.length) {
       infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
     }
-    if (activity.media.isAdult) infoBits.push('🔞 18+');
+    if (activity.media.isAdult) infoBits.push('🔞 Mature Rating');
     const infoLine = infoBits.join('  •  ');
 
     const synopsis = truncate(stripDescription(activity.media.description), 160);
 
-    const descParts = [`✦ ${username}  •  🔥 ${streak || 1}`];
+    const descParts = [`${headerLine}\n${captionLine}`];
     if (infoLine) descParts.push(infoLine);
     if (synopsis) descParts.push(synopsis);
     embed.setDescription(descParts.join('\n\n'));
@@ -654,38 +658,32 @@ async function buildEmbed(username, avatarUrl, activity, streak) {
       .setColor(color)
       .setImage(displayImage)
       .setFooter({ text: buildFooterText(0) }); // fresh post, nobody's recommended it yet
+  } else if (activity.__typename === 'TextActivity') {
+    embed
+      .setColor(DEFAULT_COLOR)
+      .setTitle('💬 Posted a status update')
+      .setURL(activity.siteUrl)
+      .setDescription(truncate(stripMarkup(activity.text), 300))
+      .setFooter({ text: 'AniList' });
+  } else if (activity.__typename === 'MessageActivity') {
+    embed
+      .setColor(DEFAULT_COLOR)
+      .setTitle('💬 Posted a message')
+      .setURL(activity.siteUrl)
+      .setDescription(truncate(stripMarkup(activity.message), 300))
+      .setFooter({ text: 'AniList' });
   } else {
-    if (avatarUrl) embed.setAuthor({ name: '\u200b', iconURL: avatarUrl });
-    const profileLine = `✦ ${username}  •  🔥 ${streak || 1}`;
-
-    if (activity.__typename === 'TextActivity') {
-      embed
-        .setColor(DEFAULT_COLOR)
-        .setTitle('💬 Posted a status update')
-        .setURL(activity.siteUrl)
-        .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.text), 300)}`)
-        .setFooter({ text: 'AniList' });
-    } else if (activity.__typename === 'MessageActivity') {
-      embed
-        .setColor(DEFAULT_COLOR)
-        .setTitle('💬 Posted a message')
-        .setURL(activity.siteUrl)
-        .setDescription(`${profileLine}\n\n${truncate(stripMarkup(activity.message), 300)}`)
-        .setFooter({ text: 'AniList' });
-    } else {
-      embed
-        .setColor(DEFAULT_COLOR)
-        .setTitle('📺 New AniList activity')
-        .setURL(`https://anilist.co/user/${username}`)
-        .setDescription(profileLine)
-        .setFooter({ text: 'AniList' });
-    }
+    embed
+      .setColor(DEFAULT_COLOR)
+      .setTitle('📺 New AniList activity')
+      .setURL(`https://anilist.co/user/${username}`)
+      .setFooter({ text: 'AniList' });
   }
   return embed;
 }
 
 async function pollAllGuilds() {
-  const data = loadData();
+  const data = await loadData();
   let changed = false;
 
   for (const guildId of Object.keys(data.guilds)) {
@@ -760,7 +758,7 @@ async function pollAllGuilds() {
     }
   }
 
-  if (changed) saveData(data);
+  if (changed) await saveData(data);
 }
 
 client.login(process.env.DISCORD_TOKEN);
