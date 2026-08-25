@@ -9,6 +9,7 @@
     "deploy-commands": "node deploy-commands.js"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.2",
     "discord.js": "^14.15.3",
     "dotenv": "^16.4.5",
     "jimp": "^0.22.12"

@@ -110,4 +110,21 @@ async function getUserFavorites(name) {
   return data.data.User;
 }
 
-module.exports = { getUserByName, getRecentActivities, getMediaById, getUserFavorites };
+async function getMediaRelations(id) {
+  const query = `
+    query ($id: Int) {
+      Media(id: $id) {
+        id
+        relations {
+          edges {
+            relationType
+            node { id type }
+          }
+        }
+      }
+    }`;
+  const data = await anilistQuery(query, { id });
+  return data.data.Media;
+}
+
+module.exports = { getUserByName, getRecentActivities, getMediaById, getUserFavorites, getMediaRelations };
