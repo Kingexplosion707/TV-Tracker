@@ -115,10 +115,17 @@ async function getMediaRelations(id) {
     query ($id: Int) {
       Media(id: $id) {
         id
+        rankings { rank type allTime }
         relations {
           edges {
             relationType
-            node { id type }
+            node {
+              id
+              type
+              title { romaji english }
+              siteUrl
+              rankings { rank type allTime }
+            }
           }
         }
       }

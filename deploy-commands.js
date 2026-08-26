@@ -36,6 +36,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName('whostracking')
     .setDescription('List who is being tracked and by whom, without pinging anyone'),
+  new SlashCommandBuilder()
+    .setName('myfavorites')
+    .setDescription('Show your personal favorites list saved via the ❤️ Favorite button (private, only you see it)'),
 ].map((c) => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
