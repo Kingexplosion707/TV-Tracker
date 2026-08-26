@@ -42,6 +42,7 @@ function showLogin() {
 function showApp() {
   document.getElementById('login-screen').hidden = true;
   document.getElementById('app').hidden = false;
+  window.scrollTo(0, 0);
   loadView('overview');
 }
 

@@ -17,6 +17,16 @@
 
 * { box-sizing: border-box; }
 
+/* Authoritative visibility rule: an author stylesheet's own `display`
+   declaration (e.g. `.login-screen { display: flex }`, `.app { display: flex }`)
+   otherwise beats the UA stylesheet's `[hidden] { display: none }` at equal
+   specificity, since normal author rules always outrank normal UA rules in
+   the cascade — regardless of source order. That let #login-screen and #app
+   render simultaneously, stacked in flow, whichever one had `hidden` set.
+   !important here forces `hidden` to always win, making the two containers'
+   visibility states properly mutually exclusive. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -47,10 +57,12 @@ button { font-family: inherit; }
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 20px;
 }
 
 .login-card {
-  width: 340px;
+  width: 100%;
+  max-width: 340px;
   background: var(--card);
   border: 1px solid var(--card-border);
   border-radius: var(--radius);
@@ -284,3 +296,36 @@ textarea { resize: vertical; font-family: inherit; }
 
 #send-guild, #send-channel { margin-bottom: 14px; }
 #send-message { margin-bottom: 16px; }
+
+/* ---------- Responsive: tablet / narrow windows ---------- */
+@media (max-width: 900px) {
+  .app { flex-direction: column; }
+
+  .sidebar {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 16px;
+    overflow-x: auto;
+  }
+  .sidebar .brand { margin-bottom: 0; flex-shrink: 0; }
+
+  .nav { flex-direction: row; flex: none; }
+  .nav-item { white-space: nowrap; }
+
+  .sidebar #logout-btn { width: auto; margin-top: 0; margin-left: auto; flex-shrink: 0; }
+
+  .main { padding: 20px 18px 40px; }
+
+  .tabs { flex-wrap: wrap; }
+}
+
+/* ---------- Responsive: narrow / resized windows ---------- */
+@media (max-width: 480px) {
+  .stat-grid { grid-template-columns: 1fr; }
+
+  .control-row { flex-direction: column; align-items: flex-start; gap: 10px; }
+
+  .list-row { flex-wrap: wrap; }
+}

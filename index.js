@@ -232,11 +232,18 @@ async function handleSlashCommand(interaction) {
     }
   } catch (err) {
     console.error(`Error handling /${commandName}:`, err);
-    const payload = { content: 'Something went wrong. Try again in a bit.', ephemeral: true };
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(payload);
-    } else {
-      await interaction.reply(payload);
+    // Same double-failure risk as the button handlers: if reply/editReply
+    // here also fails (interaction expired between the original error and
+    // now), don't let that escape uncaught and crash the process.
+    try {
+      const payload = { content: 'Something went wrong. Try again in a bit.', ephemeral: true };
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(payload);
+      } else {
+        await interaction.reply(payload);
+      }
+    } catch (replyErr) {
+      console.error(`Failed to send error reply for /${commandName} (interaction likely expired):`, replyErr.message);
     }
   }
 }
@@ -447,7 +454,19 @@ async function handleButton(interaction) {
 
   const [action, mediaIdStr] = interaction.customId.split('_');
   const mediaId = parseInt(mediaIdStr, 10);
-  if (!mediaId) return;
+  if (!mediaId || !['wl', 'rec', 'fav'].includes(action)) return;
+
+  // Ack Discord's 3s interaction window FIRST, before loadData() (a network
+  // round trip to Upstash) or any other async work gets a chance to eat into
+  // it. If the defer itself fails — the interaction already expired, or
+  // Discord is having an outage — there is nothing left to send back, so log
+  // and bail instead of touching this interaction again.
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    console.error('Failed to defer button interaction (likely expired):', err.message);
+    return;
+  }
 
   const data = await loadData();
   const guildData = ensureGuildData(data, guildId);
@@ -462,11 +481,14 @@ async function handleButton(interaction) {
     }
   } catch (err) {
     console.error('Error handling button interaction:', err);
-    const payload = { content: 'Something went wrong. Try again in a bit.', ephemeral: true };
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(payload);
-    } else {
-      await interaction.reply(payload);
+    // The interaction is already deferred at this point (we returned above
+    // if that failed), but editReply can still fail on its own (Discord
+    // hiccup, interaction expired in the meantime, etc.) — never let that
+    // escape uncaught, since an unhandled rejection here crashes the process.
+    try {
+      await interaction.editReply({ content: 'Something went wrong. Try again in a bit.' });
+    } catch (replyErr) {
+      console.error('Failed to send error reply for button interaction (interaction likely expired):', replyErr.message);
     }
   }
 }
@@ -480,20 +502,19 @@ async function handleWatchLaterButton(interaction, data, guildData, mediaId) {
   if (existingIndex !== -1) {
     list.splice(existingIndex, 1);
     await saveData(data);
-    await interaction.reply({ content: '🗑️ Removed from your watch later list.', ephemeral: true });
+    await interaction.editReply({ content: '🗑️ Removed from your watch later list.' });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
   const media = await getMediaById(mediaId).catch(() => null);
   if (!media) {
-    await interaction.editReply("Couldn't reach AniList to save that. Try again in a bit.");
+    await interaction.editReply({ content: "Couldn't reach AniList to save that. Try again in a bit." });
     return;
   }
   const title = media.title.english || media.title.romaji;
   list.push({ mediaId, title, siteUrl: media.siteUrl });
   await saveData(data);
-  await interaction.editReply(`📌 Added **${title}** to your watch later list.`);
+  await interaction.editReply({ content: `📌 Added **${title}** to your watch later list.` });
 }
 
 // Bot-local favorite toggle — mirrors Watch Later exactly, separate storage.
@@ -506,22 +527,21 @@ async function handleFavoriteButton(interaction, data, guildData, mediaId) {
   if (existingIndex !== -1) {
     list.splice(existingIndex, 1);
     await saveData(data);
-    await interaction.reply({ content: '💔 Removed from your favorites.', ephemeral: true });
+    await interaction.editReply({ content: '💔 Removed from your favorites.' });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
   const media = await getMediaById(mediaId).catch(() => null);
   if (!media) {
-    await interaction.editReply("Couldn't reach AniList to save that. Try again in a bit.");
+    await interaction.editReply({ content: "Couldn't reach AniList to save that. Try again in a bit." });
     return;
   }
   const title = media.title.english || media.title.romaji;
   list.push({ mediaId, title, siteUrl: media.siteUrl });
   await saveData(data);
-  await interaction.editReply(
-    `❤️ Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`
-  );
+  await interaction.editReply({
+    content: `❤️ Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`,
+  });
 }
 
 async function handleRecommendButton(interaction, data, guildData, mediaId) {
@@ -531,8 +551,6 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
   }
   const rec = guildData.recommendations[mediaId];
   const alreadyRecommended = rec.recommendedBy.includes(userId);
-
-  await interaction.deferReply({ ephemeral: true });
 
   if (alreadyRecommended) {
     rec.recommendedBy = rec.recommendedBy.filter((id) => id !== userId);
