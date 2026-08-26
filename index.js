@@ -26,8 +26,8 @@ const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on rel
 const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction/recommend lookups
 const MAX_SEASON_HOPS = 5; // safety cap on how far back we'll walk a prequel chain
 
-// In-memory cache of mediaId -> season number, so we only ever walk a given
-// show's prequel chain once per bot process lifetime, not on every poll.
+// In-memory cache of mediaId -> resolved season/root info, so we only ever
+// walk a given show's prequel chain once per bot process lifetime.
 const seasonCache = new Map();
 
 // Render (and most free hosts) expect something listening on a port to
@@ -57,10 +57,18 @@ client.once('ready', () => {
 // even for guilds that were first tracked before those features existed.
 function ensureGuildData(data, guildId) {
   if (!data.guilds[guildId]) {
-    data.guilds[guildId] = { channelId: null, users: [], watchlist: {}, recommendations: {}, recentPosts: {} };
+    data.guilds[guildId] = {
+      channelId: null,
+      users: [],
+      watchlist: {},
+      favorites: {},
+      recommendations: {},
+      recentPosts: {},
+    };
   }
   const guildData = data.guilds[guildId];
   if (!guildData.watchlist) guildData.watchlist = {};
+  if (!guildData.favorites) guildData.favorites = {};
   if (!guildData.recommendations) guildData.recommendations = {};
   if (!guildData.recentPosts) guildData.recentPosts = {};
   return guildData;
@@ -184,6 +192,8 @@ async function handleSlashCommand(interaction) {
       await handleSetChannel(interaction, data, guildData);
     } else if (commandName === 'watchlater') {
       handleWatchLaterList(interaction, guildData);
+    } else if (commandName === 'myfavorites') {
+      handleMyFavorites(interaction, guildData);
     } else if (commandName === 'recommendanimes') {
       handleRecommendAnimes(interaction, guildData);
     } else if (commandName === 'favorites') {
@@ -312,6 +322,26 @@ function handleWatchLaterList(interaction, guildData) {
   interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
+// Bot-local favorites — saved in AniTracker's own storage only, NOT synced
+// to the person's real AniList account favorites (that would need OAuth).
+function handleMyFavorites(interaction, guildData) {
+  const list = guildData.favorites[interaction.user.id] || [];
+  if (!list.length) {
+    interaction.reply({
+      content:
+        'Your favorites list is empty. Click ❤️ **Favorite** on any activity to add one! (Saved in the bot — not synced to your real AniList favorites.)',
+      ephemeral: true,
+    });
+    return;
+  }
+  const lines = list.map((e, i) => `${i + 1}. **[${e.title}](${e.siteUrl})**`).join('\n');
+  const embed = new EmbedBuilder()
+    .setColor(DEFAULT_COLOR)
+    .setTitle('❤️ Your Favorites (saved in the bot)')
+    .setDescription(lines);
+  interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
 function handleRecommendAnimes(interaction, guildData) {
   const recs = guildData.recommendations || {};
   const entries = Object.entries(recs)
@@ -398,6 +428,8 @@ async function handleButton(interaction) {
       await handleWatchLaterButton(interaction, data, guildData, mediaId);
     } else if (action === 'rec') {
       await handleRecommendButton(interaction, data, guildData, mediaId);
+    } else if (action === 'fav') {
+      await handleFavoriteButton(interaction, data, guildData, mediaId);
     }
   } catch (err) {
     console.error('Error handling button interaction:', err);
@@ -433,6 +465,34 @@ async function handleWatchLaterButton(interaction, data, guildData, mediaId) {
   list.push({ mediaId, title, siteUrl: media.siteUrl });
   await saveData(data);
   await interaction.editReply(`📌 Added **${title}** to your watch later list.`);
+}
+
+// Bot-local favorite toggle — mirrors Watch Later exactly, separate storage.
+async function handleFavoriteButton(interaction, data, guildData, mediaId) {
+  const userId = interaction.user.id;
+  if (!guildData.favorites[userId]) guildData.favorites[userId] = [];
+  const list = guildData.favorites[userId];
+  const existingIndex = list.findIndex((e) => e.mediaId === mediaId);
+
+  if (existingIndex !== -1) {
+    list.splice(existingIndex, 1);
+    await saveData(data);
+    await interaction.reply({ content: '💔 Removed from your favorites.', ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const media = await getMediaById(mediaId).catch(() => null);
+  if (!media) {
+    await interaction.editReply("Couldn't reach AniList to save that. Try again in a bit.");
+    return;
+  }
+  const title = media.title.english || media.title.romaji;
+  list.push({ mediaId, title, siteUrl: media.siteUrl });
+  await saveData(data);
+  await interaction.editReply(
+    `❤️ Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`
+  );
 }
 
 async function handleRecommendButton(interaction, data, guildData, mediaId) {
@@ -503,13 +563,19 @@ function buildActivityButtons(mediaId, recommendCount = 0) {
     .setEmoji('📌')
     .setStyle(ButtonStyle.Secondary);
 
+  const favoriteBtn = new ButtonBuilder()
+    .setCustomId(`fav_${mediaId}`)
+    .setLabel('Favorite')
+    .setEmoji('❤️')
+    .setStyle(ButtonStyle.Danger);
+
   const recommendBtn = new ButtonBuilder()
     .setCustomId(`rec_${mediaId}`)
     .setLabel(recommendCount ? `Recommend • ${recommendCount}` : 'Recommend')
     .setEmoji('⭐')
     .setStyle(ButtonStyle.Success);
 
-  return new ActionRowBuilder().addComponents(watchLaterBtn, recommendBtn);
+  return new ActionRowBuilder().addComponents(watchLaterBtn, favoriteBtn, recommendBtn);
 }
 
 // Only mentions the recommend count when there's actually at least one — an
@@ -533,9 +599,9 @@ function statusEmoji(status) {
   return '📺';
 }
 
-// A clean, standalone verb for the caption line under the title —
-// independent of AniList's raw status phrasing, so it combines predictably
-// with our own "Season X, Episode Y" wording.
+// A clean, standalone verb for the caption line — independent of AniList's
+// raw status phrasing, so it combines predictably with our own
+// "season X, episode Y" wording.
 function statusVerbShort(status) {
   const s = (status || '').toLowerCase();
   if (s.includes('complet')) return 'Completed';
@@ -553,28 +619,58 @@ function capitalize(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-// Walks AniList's actual PREQUEL relation chain to find a real season
-// number — correct even when each season has a completely different title
-// (unlike guessing from title text). Capped at MAX_SEASON_HOPS API calls
-// per uncached show, and cached in-memory afterward so a show's season
-// number is only ever resolved once per bot process lifetime.
-async function resolveSeasonNumber(mediaId) {
+// Pulls "#N Most Popular All Time" from a Media's rankings array, only
+// returning it if N <= 100 (anything past that isn't worth showing).
+function getPopularityRank(rankings) {
+  if (!rankings) return null;
+  const entry = rankings.find((r) => r.type === 'POPULAR' && r.allTime);
+  if (!entry || entry.rank > 100) return null;
+  return entry.rank;
+}
+
+// Walks AniList's actual PREQUEL relation chain to find the true root entry
+// of a franchise (e.g. Season 1) — correct even when each season has a
+// completely different title, unlike guessing from title text. Everywhere
+// downstream (embed title, Watch Later, Recommend, buttons) uses this root
+// identity, so different seasons of the same show consolidate into one
+// consistent entry instead of being tracked separately. Capped at
+// MAX_SEASON_HOPS API calls per uncached show, and cached in-memory
+// afterward so a show's info is only ever resolved once per bot uptime.
+async function resolveSeasonInfo(mediaId, fallbackTitle, fallbackSiteUrl) {
   if (seasonCache.has(mediaId)) return seasonCache.get(mediaId);
 
   let season = 1;
-  let cursorId = mediaId;
+  let rootId = mediaId;
+  let rootTitle = fallbackTitle;
+  let rootSiteUrl = fallbackSiteUrl;
+  let rootRankings = null;
 
+  let cursorId = mediaId;
   for (let hop = 0; hop < MAX_SEASON_HOPS; hop++) {
     const media = await getMediaRelations(cursorId).catch(() => null);
-    const edges = media?.relations?.edges;
+    if (!media) break;
+    if (hop === 0) rootRankings = media.rankings || null; // in case this entry turns out to already be the root
+
+    const edges = media.relations?.edges;
     if (!edges) break;
     const prequel = edges.find((e) => e.relationType === 'PREQUEL');
     if (!prequel) break;
+
     season += 1;
+    rootId = prequel.node.id;
+    rootTitle = prequel.node.title?.english || prequel.node.title?.romaji || rootTitle;
+    rootSiteUrl = prequel.node.siteUrl || rootSiteUrl;
+    rootRankings = prequel.node.rankings || null;
     cursorId = prequel.node.id;
   }
 
-  const result = season > 1 ? season : null;
+  const result = {
+    season: season > 1 ? season : null,
+    rootId,
+    rootTitle,
+    rootSiteUrl,
+    popularityRank: getPopularityRank(rootRankings),
+  };
   seasonCache.set(mediaId, result);
   return result;
 }
@@ -606,33 +702,43 @@ function truncate(text, max) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-async function buildEmbed(username, avatarUrl, activity, streak) {
+async function buildEmbed(username, avatarUrl, activity, streak, seasonInfo) {
   const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
 
-  const authorOpts = { name: `✦ ${username}  •  🔥 ${streak || 1}`, url: `https://anilist.co/user/${username}` };
+  // Author's url applies to its ENTIRE name text as one clickable unit —
+  // there's no way to link just the username and exclude the streak from
+  // that click region within a single field. Keeping them together here is
+  // also the only way to have the streak appear on the same row as the
+  // avatar icon, since that icon only exists in the Author field.
+  const authorOpts = {
+    name: `✦ ${username}   🔥 ${streak || 1}`,
+    url: `https://anilist.co/user/${username}`,
+  };
   if (avatarUrl) authorOpts.iconURL = avatarUrl;
   embed.setAuthor(authorOpts);
 
   if (activity.__typename === 'ListActivity') {
-    const title = activity.media.title.english || activity.media.title.romaji;
-    const season = await resolveSeasonNumber(activity.media.id);
-
-    // "# " header markdown renders bigger than embed Title styling and,
-    // unlike Title, supports being a link without forcing an underline —
-    // so the big clickable anime name lives here in the description,
-    // not in the actual embed Title field (left unused for this type).
-    const headerLine = `# [${title}](${activity.media.siteUrl})`;
+    const { season, rootTitle, rootSiteUrl, popularityRank } = seasonInfo;
 
     const subParts = [];
-    if (season) subParts.push(`Season ${season}`);
-    if (activity.progress) subParts.push(`Episode ${activity.progress}`);
+    if (season) subParts.push(`season ${season}`);
+    if (activity.progress) subParts.push(`episode ${activity.progress}`);
     const progressSuffix = subParts.join(', ');
     const captionLine = progressSuffix
-      ? `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)} ${progressSuffix}`
-      : `${statusEmoji(activity.status)} ${statusVerbShort(activity.status)}`;
+      ? `${statusVerbShort(activity.status)} ${progressSuffix} ${statusEmoji(activity.status)}`
+      : `${statusVerbShort(activity.status)} ${statusEmoji(activity.status)}`;
+
+    // "# " header markdown renders bigger than embed Title styling and,
+    // unlike Title, supports being a link without forcing an underline.
+    // Uses the resolved ROOT title/link (e.g. always "Attack on Titan"),
+    // not this specific season's own AniList title/page.
+    const headerLine = `# [${rootTitle}](${rootSiteUrl})`;
 
     // Portrait cover art — already the largest size AniList provides
-    // ("extraLarge"), there's no higher resolution to request above this.
+    // ("extraLarge"). Worth noting: even a genuinely higher-resolution
+    // source wouldn't render any bigger in Discord, since Discord caps the
+    // embed image's display width itself regardless of the source file's
+    // resolution — the platform, not the source, is the real ceiling here.
     const displayImage =
       activity.media.coverImage.extraLarge || activity.media.coverImage.large || activity.media.coverImage.medium;
     const color = await getDominantColor(displayImage);
@@ -644,12 +750,13 @@ async function buildEmbed(username, avatarUrl, activity, streak) {
     if (activity.media.genres && activity.media.genres.length) {
       infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
     }
-    if (activity.media.isAdult) infoBits.push('🔞 Mature Rating');
+    if (activity.media.isAdult) infoBits.push('🔞 Mature');
+    if (popularityRank) infoBits.push(`🌍 #${popularityRank} Most Popular`);
     const infoLine = infoBits.join('  •  ');
 
     const synopsis = truncate(stripDescription(activity.media.description), 160);
 
-    const descParts = [`${headerLine}\n${captionLine}`];
+    const descParts = [`${captionLine}\n${headerLine}`];
     if (infoLine) descParts.push(infoLine);
     if (synopsis) descParts.push(synopsis);
     embed.setDescription(descParts.join('\n\n'));
@@ -711,10 +818,15 @@ async function pollAllGuilds() {
         }
 
         for (const activity of newOnes) {
-          const embed = await buildEmbed(user.username, user.avatar, activity, user.streak);
+          let seasonInfo = null;
+          if (activity.__typename === 'ListActivity') {
+            const fallbackTitle = activity.media.title.english || activity.media.title.romaji;
+            seasonInfo = await resolveSeasonInfo(activity.media.id, fallbackTitle, activity.media.siteUrl);
+          }
+
+          const embed = await buildEmbed(user.username, user.avatar, activity, user.streak, seasonInfo);
           const content = user.addedBy ? `<@${user.addedBy}>` : undefined;
-          const components =
-            activity.__typename === 'ListActivity' ? [buildActivityButtons(activity.media.id, 0)] : [];
+          const components = seasonInfo ? [buildActivityButtons(seasonInfo.rootId, 0)] : [];
 
           const sentMessage = await channel.send({
             content,
@@ -729,10 +841,7 @@ async function pollAllGuilds() {
           // Remember this post so a later reaction/recommend can be traced back to who to notify.
           guildData.recentPosts[sentMessage.id] = {
             addedBy: user.addedBy || null,
-            animeTitle:
-              activity.__typename === 'ListActivity'
-                ? activity.media.title.english || activity.media.title.romaji
-                : null,
+            animeTitle: seasonInfo ? seasonInfo.rootTitle : null,
           };
           changed = true;
         }
