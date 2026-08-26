@@ -1,5 +1,6 @@
 require('dotenv').config();
-const http = require('http');
+const path = require('path');
+const express = require('express');
 const {
   Client,
   GatewayIntentBits,
@@ -20,6 +21,7 @@ const {
   getMediaRelations,
 } = require('./anilist');
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
+const { buildDashboardRouter } = require('./dashboard/routes');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
 const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on relaunch
@@ -30,24 +32,51 @@ const MAX_SEASON_HOPS = 5; // safety cap on how far back we'll walk a prequel ch
 // walk a given show's prequel chain once per bot process lifetime.
 const seasonCache = new Map();
 
-// Render (and most free hosts) expect something listening on a port to
-// consider the service "alive". This also gives an external ping service
-// (e.g. UptimeRobot) something to hit to keep the bot from sleeping.
-const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('AniList Discord bot is running.');
-  })
-  .listen(PORT, () => console.log(`Keep-alive web server listening on port ${PORT}`));
+// Polling can be paused from the dashboard (Bot Controls -> Pause). The bot
+// stays online and keeps responding to slash commands/buttons either way —
+// this only gates the periodic AniList check + new activity posts. Backed
+// by data.botPaused so the state survives a restart; this in-memory flag is
+// just what pollAllGuilds actually reads each tick.
+let isPaused = false;
+const botStartedAt = Date.now();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
   partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
-client.once('ready', () => {
+// Render (and most free hosts) expect something listening on a port to
+// consider the service "alive". This also gives an external ping service
+// (e.g. UptimeRobot) something to hit to keep the bot from sleeping, and is
+// now also where the developer dashboard is served from.
+const PORT = process.env.PORT || 3000;
+const app = express();
+
+app.get('/', (req, res) => {
+  res.type('text/plain').send('AniList Discord bot is running.');
+});
+
+app.use('/dashboard', express.static(path.join(__dirname, 'dashboard', 'public')));
+app.use(
+  '/dashboard/api',
+  buildDashboardRouter(client, {
+    loadData,
+    saveData,
+    getPaused: () => isPaused,
+    setPaused: (val) => {
+      isPaused = val;
+    },
+    botStartedAt,
+  })
+);
+
+app.listen(PORT, () => console.log(`Web server (keep-alive + dashboard) listening on port ${PORT}`));
+
+client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  const data = await loadData();
+  isPaused = data.botPaused; // restore pause state across restarts (e.g. after a redeploy)
+  if (isPaused) console.log('Polling starting in PAUSED state (resume from the dashboard to enable it).');
   pollAllGuilds();
   setInterval(pollAllGuilds, POLL_INTERVAL_MS);
   notifyRelaunch();
@@ -790,6 +819,8 @@ async function buildEmbed(username, avatarUrl, activity, streak, seasonInfo) {
 }
 
 async function pollAllGuilds() {
+  if (isPaused) return; // paused from the dashboard — skip this tick entirely
+
   const data = await loadData();
   let changed = false;
 
@@ -822,6 +853,18 @@ async function pollAllGuilds() {
           if (activity.__typename === 'ListActivity') {
             const fallbackTitle = activity.media.title.english || activity.media.title.romaji;
             seasonInfo = await resolveSeasonInfo(activity.media.id, fallbackTitle, activity.media.siteUrl);
+
+            // "Most Watched" leaderboard on the dashboard: a global (cross-server),
+            // ever-growing tally of how many activity updates a title has produced.
+            // Keyed by the same resolved root id used everywhere else so seasons
+            // of one show accumulate together.
+            const key = String(seasonInfo.rootId);
+            const entry = data.watchStats[key] || { title: seasonInfo.rootTitle, siteUrl: seasonInfo.rootSiteUrl, count: 0 };
+            entry.count += 1;
+            entry.title = seasonInfo.rootTitle;
+            entry.siteUrl = seasonInfo.rootSiteUrl;
+            data.watchStats[key] = entry;
+            changed = true;
           }
 
           const embed = await buildEmbed(user.username, user.avatar, activity, user.streak, seasonInfo);

@@ -22,24 +22,44 @@ if (hasUpstash) {
   );
 }
 
+// Ensures every top-level field the dashboard (and the rest of the bot)
+// relies on exists, even for data blobs saved before these fields existed.
+// Mirrors the same "backfill defaults on read" pattern index.js already
+// uses for per-guild data via ensureGuildData.
+function ensureTopLevel(data) {
+  if (!data.guilds) data.guilds = {};
+  if (typeof data.botPaused !== 'boolean') data.botPaused = false;
+  // watchStats: global (cross-server) counter of how many times each root
+  // anime/manga has shown up in a posted activity update. Keyed by the
+  // resolved root AniList media id (same id used for the action buttons),
+  // so seasons of the same show accumulate under one entry.
+  if (!data.watchStats) data.watchStats = {};
+  // linkedAccounts: Discord user id -> AniList account info, populated once
+  // a real /signin OAuth flow exists. Empty scaffold for now so the
+  // dashboard has a stable shape to read from.
+  if (!data.linkedAccounts) data.linkedAccounts = {};
+  return data;
+}
+
 async function loadData() {
   if (redis) {
     try {
       const raw = await redis.get(STORAGE_KEY);
-      if (!raw) return { guilds: {} };
-      return typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!raw) return ensureTopLevel({ guilds: {} });
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return ensureTopLevel(parsed);
     } catch (e) {
       console.error('Failed to load from Upstash, starting fresh this run:', e.message);
-      return { guilds: {} };
+      return ensureTopLevel({ guilds: {} });
     }
   }
 
   try {
-    if (!fs.existsSync(LOCAL_PATH)) return { guilds: {} };
-    return JSON.parse(fs.readFileSync(LOCAL_PATH, 'utf8'));
+    if (!fs.existsSync(LOCAL_PATH)) return ensureTopLevel({ guilds: {} });
+    return ensureTopLevel(JSON.parse(fs.readFileSync(LOCAL_PATH, 'utf8')));
   } catch (e) {
     console.error('Failed to load local storage, starting fresh:', e.message);
-    return { guilds: {} };
+    return ensureTopLevel({ guilds: {} });
   }
 }
 
