@@ -13,6 +13,62 @@ function snowflakeToDate(id) {
   }
 }
 
+// Channel the "AniTracker - Feedback" webhook posts into (Make.com relays
+// Webflow site-feedback submissions there). Webhook URLs are write-only —
+// there's no way to list past messages through them — so the dashboard
+// reads this channel directly via the bot's own client instead.
+const FEEDBACK_CHANNEL_ID = process.env.FEEDBACK_CHANNEL_ID || '1541620519911034910';
+const VALID_FEEDBACK_STATUSES = new Set(['resolved', 'disputed', 'later']);
+
+// Parses a feedback message's plain-text content, e.g.:
+//   📩 New AniTracker Submission!
+//
+//   ⭐ Rating: 4/5
+//
+//   💬 Feedback/Question: fasfasf
+//
+//   📧 Contact: fsafas
+// The rating line is omitted entirely when the submitter leaves it blank,
+// so every field here is optional except content, which falls back to the
+// raw message if the label line is ever missing — never returns empty.
+function parseFeedbackMessage(content) {
+  const text = content || '';
+  const ratingMatch = text.match(/⭐\s*Rating:\s*(\d+)\s*\/\s*5/i);
+  const feedbackMatch = text.match(/💬\s*Feedback\/Question:\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+  const contactMatch = text.match(/📧\s*Contact:\s*([\s\S]*?)(?:\n\s*\n|$)/i);
+  return {
+    rating: ratingMatch ? Math.min(5, parseInt(ratingMatch[1], 10)) : null,
+    content: feedbackMatch ? feedbackMatch[1].trim() : text.trim(),
+    contact: contactMatch ? contactMatch[1].trim() : null,
+  };
+}
+
+// Fetches + parses feedback submissions from the feedback channel, merging
+// in this dashboard's own resolve/dispute/keep-for-later status. Returns []
+// on any failure (bad channel id, bot removed, permissions) rather than
+// throwing — callers like /overview must never break because of this.
+async function fetchFeedbackMessages(client, loadData) {
+  const channel = await client.channels.fetch(FEEDBACK_CHANNEL_ID).catch(() => null);
+  if (!channel) return [];
+
+  const fetched = await channel.messages.fetch({ limit: 100 }).catch(() => null); // Discord's per-call cap; no pagination in v1
+  if (!fetched) return [];
+
+  const data = await loadData();
+  return [...fetched.values()]
+    .filter((m) => m.webhookId || /📩\s*New AniTracker Submission/i.test(m.content)) // ignore any unrelated message someone posts in this channel
+    .map((m) => {
+      const parsed = parseFeedbackMessage(m.content);
+      return {
+        messageId: m.id,
+        ...parsed,
+        postedAt: snowflakeToDate(m.id),
+        status: data.feedbackStatus[m.id] || null,
+      };
+    })
+    .sort((a, b) => Number(b.messageId) - Number(a.messageId));
+}
+
 // client: the discord.js Client instance (for live guild/channel/user info)
 // deps: { loadData, saveData, getPaused, setPaused, botStartedAt }
 function buildDashboardRouter(client, deps) {
@@ -57,6 +113,9 @@ function buildDashboardRouter(client, deps) {
       return sum + Object.values(recs).reduce((s, r) => s + (r.recommendedBy?.length || 0), 0);
     }, 0);
 
+    const feedback = await fetchFeedbackMessages(client, loadData);
+    const pendingFeedback = feedback.filter((f) => !f.status).length;
+
     res.json({
       botTag: client.user?.tag || null,
       botAvatar: client.user?.displayAvatarURL?.({ size: 128 }) || null,
@@ -65,6 +124,7 @@ function buildDashboardRouter(client, deps) {
       totalRecommendations,
       botPaused: getPaused(),
       uptimeSeconds: Math.floor((Date.now() - botStartedAt) / 1000),
+      pendingFeedback,
     });
   });
 
@@ -205,6 +265,31 @@ function buildDashboardRouter(client, deps) {
       accounts,
       note: 'Placeholder — populates once AniList sign-in (/signin) ships.',
     });
+  });
+
+  // ---- Feedback ----------------------------------------------------------
+  router.get('/feedback', async (req, res) => {
+    const channel = await client.channels.fetch(FEEDBACK_CHANNEL_ID).catch(() => null);
+    if (!channel) {
+      return res.status(502).json({ error: 'Could not reach the feedback channel (bot removed, bad channel id, or missing permissions).' });
+    }
+    const feedback = await fetchFeedbackMessages(client, loadData);
+    res.json({ feedback });
+  });
+
+  router.post('/feedback/:messageId/status', async (req, res) => {
+    const { status } = req.body || {};
+    if (status !== null && !VALID_FEEDBACK_STATUSES.has(status)) {
+      return res.status(400).json({ error: 'status must be resolved, disputed, later, or null.' });
+    }
+    const data = await loadData();
+    if (status === null || status === undefined) {
+      delete data.feedbackStatus[req.params.messageId];
+    } else {
+      data.feedbackStatus[req.params.messageId] = status;
+    }
+    await saveData(data);
+    res.json({ ok: true, status: status || null });
   });
 
   // ---- Send message ----------------------------------------------------

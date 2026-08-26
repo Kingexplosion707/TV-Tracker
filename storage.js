@@ -38,6 +38,10 @@ function ensureTopLevel(data) {
   // a real /signin OAuth flow exists. Empty scaffold for now so the
   // dashboard has a stable shape to read from.
   if (!data.linkedAccounts) data.linkedAccounts = {};
+  // feedbackStatus: Discord message id (of a feedback submission posted by
+  // the "AniTracker - Feedback" webhook) -> 'resolved' | 'disputed' | 'later'.
+  // Absent entry means "New" (not yet triaged). Dashboard-only concern.
+  if (!data.feedbackStatus) data.feedbackStatus = {};
   return data;
 }
 

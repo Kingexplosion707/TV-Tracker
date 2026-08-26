@@ -65,6 +65,35 @@ document.getElementById('logout-btn').addEventListener('click', async () => {
   showLogin();
 });
 
+/* ---------------- Sidebar collapse ---------------- */
+
+const SIDEBAR_COLLAPSE_KEY = 'anitracker:sidebarCollapsed';
+
+// No stored preference yet -> default collapsed on narrow/mobile widths, so
+// first-time mobile visitors get the compact icon rail instead of a wall of
+// full-label nav buttons.
+function getStoredCollapse() {
+  try {
+    const stored = localStorage.getItem(SIDEBAR_COLLAPSE_KEY);
+    if (stored !== null) return stored === '1';
+  } catch {}
+  return window.innerWidth <= 900;
+}
+
+function setStoredCollapse(val) {
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSE_KEY, val ? '1' : '0');
+  } catch {}
+}
+
+const sidebarEl = document.querySelector('.sidebar');
+if (getStoredCollapse()) sidebarEl.classList.add('sidebar-collapsed');
+
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  const collapsed = sidebarEl.classList.toggle('sidebar-collapsed');
+  setStoredCollapse(collapsed);
+});
+
 /* ---------------- Nav ---------------- */
 
 const viewTitles = {
@@ -73,12 +102,18 @@ const viewTitles = {
   users: 'Tracked Users',
   activity: 'Recent Activity',
   leaderboards: 'Leaderboards',
+  feedback: 'Feedback',
   send: 'Send Message',
   controls: 'Bot Controls',
 };
 
 document.querySelectorAll('.nav-item').forEach((btn) => {
   btn.addEventListener('click', () => loadView(btn.dataset.view));
+});
+
+// Shared by the Overview page's "View all" shortcut on the Recent Activity snippet.
+document.querySelectorAll('[data-goto-view]').forEach((btn) => {
+  btn.addEventListener('click', () => loadView(btn.dataset.gotoView));
 });
 
 function loadView(view) {
@@ -91,11 +126,14 @@ function loadView(view) {
   else if (view === 'users') renderUsers();
   else if (view === 'activity') renderActivity();
   else if (view === 'leaderboards') renderLeaderboard(currentTab);
+  else if (view === 'feedback') renderFeedback(currentFeedbackTab);
   else if (view === 'send') renderSend();
   else if (view === 'controls') renderControls();
 }
 
 /* ---------------- Overview ---------------- */
+
+const RENDER_DASHBOARD_URL = 'https://dashboard.render.com/web/srv-d9pbdp2jnfac73ebhdq0';
 
 async function renderOverview() {
   const data = await api('/overview');
@@ -107,6 +145,7 @@ async function renderOverview() {
     ['Servers', data.totalServers],
     ['Tracked Users', data.totalTrackedUsers],
     ['Recommend Votes', data.totalRecommendations],
+    ['Pending Feedback', data.pendingFeedback ?? 0],
     ['Uptime', formatUptime(data.uptimeSeconds)],
   ];
   for (const [label, value] of cards) {
@@ -123,9 +162,31 @@ async function renderOverview() {
         <div class="row-title">${data.botTag || 'AniTracker'}</div>
         <div class="row-sub">${data.botPaused ? 'Polling paused' : 'Polling every few minutes'}</div>
       </div>
+      <a class="btn btn-ghost btn-small" href="${RENDER_DASHBOARD_URL}" target="_blank" rel="noopener">Open on Render →</a>
     </div>
   `)
   );
+
+  await renderOverviewActivitySnippet();
+  wireSendForm({
+    guildSelect: document.getElementById('overview-send-guild'),
+    channelSelect: document.getElementById('overview-send-channel'),
+    messageEl: document.getElementById('overview-send-message'),
+    sendBtn: document.getElementById('overview-send-btn'),
+    resultEl: document.getElementById('overview-send-result'),
+  });
+}
+
+async function renderOverviewActivitySnippet() {
+  const list = document.getElementById('overview-activity-list');
+  list.innerHTML = '';
+  try {
+    const { activity } = await api('/activity?limit=5');
+    if (!activity.length) return list.appendChild(el('<div class="empty-state">No activity posted yet.</div>'));
+    for (const a of activity) list.appendChild(activityRow(a));
+  } catch (err) {
+    list.appendChild(el(`<div class="empty-state">Could not load activity: ${escapeHtml(err.message)}</div>`));
+  }
 }
 
 function formatUptime(seconds) {
@@ -192,24 +253,24 @@ async function renderUsers() {
 
 /* ---------------- Activity ---------------- */
 
+function activityRow(a) {
+  return el(`
+    <div class="list-row">
+      <div class="row-main">
+        <div class="row-title">${escapeHtml(a.animeTitle || 'Activity update')}</div>
+        <div class="row-sub">${escapeHtml(a.guildName)}${a.addedBy ? ` · tracked for ${a.addedBy}` : ''}</div>
+      </div>
+      <div class="row-count">${timeAgo(a.postedAt)}</div>
+    </div>
+  `);
+}
+
 async function renderActivity() {
   const { activity } = await api('/activity?limit=100');
   const list = document.getElementById('activity-list');
   list.innerHTML = '';
   if (!activity.length) return list.appendChild(el('<div class="empty-state">No activity posted yet.</div>'));
-  for (const a of activity) {
-    list.appendChild(
-      el(`
-      <div class="list-row">
-        <div class="row-main">
-          <div class="row-title">${escapeHtml(a.animeTitle || 'Activity update')}</div>
-          <div class="row-sub">${escapeHtml(a.guildName)}${a.addedBy ? ` · tracked for ${a.addedBy}` : ''}</div>
-        </div>
-        <div class="row-count">${timeAgo(a.postedAt)}</div>
-      </div>
-    `)
-    );
-  }
+  for (const a of activity) list.appendChild(activityRow(a));
 }
 
 /* ---------------- Leaderboards ---------------- */
@@ -272,18 +333,99 @@ async function renderLeaderboard(tab) {
   }
 }
 
+/* ---------------- Feedback ---------------- */
+
+let currentFeedbackTab = 'all';
+document.querySelectorAll('[data-feedback-tab]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-feedback-tab]').forEach((b) => b.classList.toggle('active', b === btn));
+    currentFeedbackTab = btn.dataset.feedbackTab;
+    renderFeedback(currentFeedbackTab);
+  });
+});
+
+const FEEDBACK_STATUS_LABELS = { resolved: 'Resolved', disputed: 'Disputed', later: 'Keep for Later' };
+
+function feedbackCard(f) {
+  const stars = f.rating
+    ? `${'★'.repeat(f.rating)}${'☆'.repeat(5 - f.rating)} <span class="muted-note">${f.rating}/5</span>`
+    : '<span class="muted-note">No rating given</span>';
+  const statusLabel = FEEDBACK_STATUS_LABELS[f.status] || 'New';
+
+  const node = el(`
+    <div class="card feedback-card">
+      <div class="card-header">
+        <span class="badge feedback-badge-${f.status || 'new'}">${statusLabel}</span>
+        <span class="muted-note">${timeAgo(f.postedAt)}</span>
+      </div>
+      <div class="feedback-rating">${stars}</div>
+      <p class="feedback-content">${escapeHtml(f.content)}</p>
+      <p class="muted-note">Contact: ${f.contact ? escapeHtml(f.contact) : '—'}</p>
+      <div class="feedback-actions"></div>
+    </div>
+  `);
+
+  const actions = node.querySelector('.feedback-actions');
+  const actionDefs = [
+    ['resolved', 'Resolve', 'btn-primary'],
+    ['disputed', 'Dispute', 'btn-danger'],
+    ['later', 'Keep for Later', 'btn-ghost'],
+  ].filter(([status]) => status !== f.status);
+  if (f.status) actionDefs.push([null, 'Reset to New', 'btn-ghost']);
+
+  for (const [status, label, cls] of actionDefs) {
+    const btn = el(`<button class="btn ${cls} btn-small">${label}</button>`);
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api(`/feedback/${f.messageId}/status`, { method: 'POST', body: JSON.stringify({ status }) });
+        renderFeedback(currentFeedbackTab);
+      } catch (err) {
+        btn.disabled = false;
+        alert(`Error: ${err.message}`);
+      }
+    };
+    actions.appendChild(btn);
+  }
+
+  return node;
+}
+
+async function renderFeedback(tab) {
+  const list = document.getElementById('feedback-list');
+  list.innerHTML = '';
+  let feedback;
+  try {
+    ({ feedback } = await api('/feedback'));
+  } catch (err) {
+    list.appendChild(el(`<div class="empty-state">Could not load feedback: ${escapeHtml(err.message)}</div>`));
+    return;
+  }
+
+  const filtered =
+    tab === 'all' ? feedback : tab === 'new' ? feedback.filter((f) => !f.status) : feedback.filter((f) => f.status === tab);
+
+  if (!filtered.length) return list.appendChild(el('<div class="empty-state">No feedback here.</div>'));
+  for (const f of filtered) list.appendChild(feedbackCard(f));
+}
+
 /* ---------------- Send message ---------------- */
 
-async function renderSend() {
-  const guildSelect = document.getElementById('send-guild');
-  const channelSelect = document.getElementById('send-channel');
+// Shared by the full Send Message view and the Overview page's Quick Send
+// snippet, so both stay in sync with a single implementation.
+async function wireSendForm({ guildSelect, channelSelect, messageEl, sendBtn, resultEl }) {
+  async function populateChannels(guildId) {
+    if (!guildId) return (channelSelect.innerHTML = '');
+    const { channels } = await api(`/servers/${guildId}/channels`);
+    channelSelect.innerHTML = channels.map((c) => `<option value="${c.id}">#${escapeHtml(c.name)}</option>`).join('');
+  }
+
   const { servers } = await api('/servers');
   guildSelect.innerHTML = servers.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
   await populateChannels(servers[0]?.id);
   guildSelect.onchange = () => populateChannels(guildSelect.value);
 
-  document.getElementById('send-btn').onclick = async () => {
-    const resultEl = document.getElementById('send-result');
+  sendBtn.onclick = async () => {
     resultEl.textContent = 'Sending…';
     try {
       await api('/send', {
@@ -291,21 +433,25 @@ async function renderSend() {
         body: JSON.stringify({
           guildId: guildSelect.value,
           channelId: channelSelect.value,
-          message: document.getElementById('send-message').value,
+          message: messageEl.value,
         }),
       });
       resultEl.textContent = 'Sent ✓';
-      document.getElementById('send-message').value = '';
+      messageEl.value = '';
     } catch (err) {
       resultEl.textContent = `Error: ${err.message}`;
     }
   };
+}
 
-  async function populateChannels(guildId) {
-    if (!guildId) return (channelSelect.innerHTML = '');
-    const { channels } = await api(`/servers/${guildId}/channels`);
-    channelSelect.innerHTML = channels.map((c) => `<option value="${c.id}">#${escapeHtml(c.name)}</option>`).join('');
-  }
+async function renderSend() {
+  await wireSendForm({
+    guildSelect: document.getElementById('send-guild'),
+    channelSelect: document.getElementById('send-channel'),
+    messageEl: document.getElementById('send-message'),
+    sendBtn: document.getElementById('send-btn'),
+    resultEl: document.getElementById('send-result'),
+  });
 }
 
 /* ---------------- Controls ---------------- */
