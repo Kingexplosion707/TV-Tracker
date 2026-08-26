@@ -34,6 +34,13 @@ function ensureTopLevel(data) {
   // resolved root AniList media id (same id used for the action buttons),
   // so seasons of the same show accumulate under one entry.
   if (!data.watchStats) data.watchStats = {};
+  // globalRecommendations: cross-server "Recommend" tally, keyed the same
+  // way as a guild's own `recommendations` ({ title, siteUrl, recommendedBy }).
+  // A user's id only ever appears once per media here, no matter how many
+  // servers they clicked Recommend in — see handleRecommendButton in
+  // index.js for how membership is kept in sync as votes are added/removed.
+  // Powers the "Global" option on the /recommendanimes scope dropdown.
+  if (!data.globalRecommendations) data.globalRecommendations = {};
   // linkedAccounts: Discord user id -> AniList account info, populated once
   // a real /signin OAuth flow exists. Empty scaffold for now so the
   // dashboard has a stable shape to read from.

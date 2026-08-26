@@ -10,6 +10,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   MessageFlags,
 } = require('discord.js');
 const { loadData, saveData } = require('./storage');
@@ -100,6 +101,7 @@ function ensureGuildData(data, guildId) {
   if (!guildData.favorites) guildData.favorites = {};
   if (!guildData.recommendations) guildData.recommendations = {};
   if (!guildData.recentPosts) guildData.recentPosts = {};
+  if (!data.globalRecommendations) data.globalRecommendations = {};
   return guildData;
 }
 
@@ -145,6 +147,8 @@ client.on('interactionCreate', async (interaction) => {
     await handleSlashCommand(interaction);
   } else if (interaction.isButton()) {
     await handleButton(interaction);
+  } else if (interaction.isStringSelectMenu()) {
+    await handleSelectMenu(interaction);
   }
 });
 
@@ -224,7 +228,7 @@ async function handleSlashCommand(interaction) {
     } else if (commandName === 'myfavorites') {
       handleMyFavorites(interaction, guildData);
     } else if (commandName === 'recommendanimes') {
-      handleRecommendAnimes(interaction, guildData);
+      handleRecommendAnimes(interaction, guildData, data);
     } else if (commandName === 'favorites') {
       await handleFavorites(interaction);
     } else if (commandName === 'whostracking') {
@@ -345,7 +349,7 @@ function handleWatchLaterList(interaction, guildData) {
   const list = guildData.watchlist[interaction.user.id] || [];
   if (!list.length) {
     interaction.reply({
-      content: 'Your watch later list is empty. Click 📌 **Watch Later** on any activity to add one!',
+      content: 'Your watch later list is empty. Click 📌 **Watch later** on any activity to add one!',
       ephemeral: true,
     });
     return;
@@ -365,7 +369,7 @@ function handleMyFavorites(interaction, guildData) {
   if (!list.length) {
     interaction.reply({
       content:
-        'Your favorites list is empty. Click ❤️ **Favorite** on any activity to add one! (Saved in the bot — not synced to your real AniList favorites.)',
+        'Your favorites list is empty. Click 🤍 **Favorite** on any activity to add one! (Saved in the bot — not synced to your real AniList favorites.)',
       ephemeral: true,
     });
     return;
@@ -373,34 +377,110 @@ function handleMyFavorites(interaction, guildData) {
   const lines = list.map((e, i) => `${i + 1}. **[${e.title}](${e.siteUrl})**`).join('\n');
   const embed = new EmbedBuilder()
     .setColor(DEFAULT_COLOR)
-    .setTitle('❤️ Your Favorites (saved in the bot)')
+    .setTitle('🤍 Your Favorites (saved in the bot)')
     .setDescription(lines);
   interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
-function handleRecommendAnimes(interaction, guildData) {
-  const recs = guildData.recommendations || {};
-  const entries = Object.entries(recs)
+// Cross-server ("Global") vs this-server tallies, selectable via a dropdown
+// on the reply itself. Global entries live in data.globalRecommendations —
+// see handleRecommendButton for how a user's vote only ever counts once
+// there, no matter how many servers they recommend the same show in.
+const RECOMMEND_EMBED_COLOR = 0xff9800; // vivid orange-yellow — recommendanimes embed only
+
+function buildRecommendEntries(recsObj) {
+  return Object.entries(recsObj || {})
     .filter(([, r]) => r.title && r.recommendedBy && r.recommendedBy.length > 0)
     .map(([mediaId, r]) => ({ mediaId, title: r.title, siteUrl: r.siteUrl, count: r.recommendedBy.length }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
+}
+
+function buildRecommendEmbed(scope, guildData, data) {
+  const isGlobal = scope === 'global';
+  const entries = buildRecommendEntries(isGlobal ? data.globalRecommendations : guildData.recommendations);
+  const scopeLabel = isGlobal ? '🌍 Global' : '🏠 This Server';
+
+  const embed = new EmbedBuilder()
+    .setColor(RECOMMEND_EMBED_COLOR)
+    .setTitle('⭐ Most Recommended Anime')
+    .setFooter({ text: `Showing: ${scopeLabel} — use the menu below to switch` })
+    .setTimestamp(new Date());
 
   if (!entries.length) {
-    interaction.reply('No recommendations yet — click ⭐ **Recommend** on an activity to start the leaderboard!');
-    return;
+    embed.setDescription(
+      isGlobal
+        ? 'No recommendations anywhere yet — click ⭐ **Recommend** on an activity to start the leaderboard!'
+        : 'No recommendations in this server yet — click ⭐ **Recommend** on an activity to start the leaderboard!'
+    );
+    return embed;
   }
 
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = entries
-    .map(
-      (e, i) =>
-        `${medals[i] || `**${i + 1}.**`} **[${e.title}](${e.siteUrl})** — ${e.count} ${e.count === 1 ? 'vote' : 'votes'}`
-    )
-    .join('\n');
+  const totalVotes = entries.reduce((sum, e) => sum + e.count, 0);
+  embed.setDescription(
+    `**${scopeLabel}**  •  ${totalVotes} total ${totalVotes === 1 ? 'vote' : 'votes'} across ${entries.length} title${
+      entries.length === 1 ? '' : 's'
+    }`
+  );
 
-  const embed = new EmbedBuilder().setColor(0xffd700).setTitle('⭐ Most Recommended Anime').setDescription(lines);
-  interaction.reply({ embeds: [embed] });
+  entries.forEach((e, i) => {
+    embed.addFields({
+      name: `${medals[i] || `#${i + 1}`}  ${e.title}`,
+      value: `[View on AniList ↗](${e.siteUrl})\n**${e.count}** ${e.count === 1 ? 'vote' : 'votes'}`,
+      inline: entries.length > 3,
+    });
+  });
+
+  return embed;
+}
+
+function buildRecommendScopeRow(scope) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('recscope')
+    .setPlaceholder('Choose a scope to view')
+    .addOptions(
+      {
+        label: 'This Server',
+        description: 'Recommendations made in this server',
+        value: 'guild',
+        emoji: '🏠',
+        default: scope !== 'global',
+      },
+      {
+        label: 'Global',
+        description: 'Recommendations from every server (one vote per person)',
+        value: 'global',
+        emoji: '🌍',
+        default: scope === 'global',
+      }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function handleRecommendAnimes(interaction, guildData, data) {
+  const scope = 'guild';
+  const embed = buildRecommendEmbed(scope, guildData, data);
+  const row = buildRecommendScopeRow(scope);
+  interaction.reply({ embeds: [embed], components: [row] });
+}
+
+// Handles the This Server / Global dropdown on a /recommendanimes reply.
+async function handleSelectMenu(interaction) {
+  if (interaction.customId !== 'recscope') return;
+  const guildId = interaction.guildId;
+  if (!guildId) return;
+
+  try {
+    const data = await loadData();
+    const guildData = ensureGuildData(data, guildId);
+    const scope = interaction.values[0] === 'global' ? 'global' : 'guild';
+    const embed = buildRecommendEmbed(scope, guildData, data);
+    const row = buildRecommendScopeRow(scope);
+    await interaction.update({ embeds: [embed], components: [row] });
+  } catch (err) {
+    console.error('Error handling recommend scope select:', err.message);
+  }
 }
 
 async function handleFavorites(interaction) {
@@ -540,7 +620,7 @@ async function handleFavoriteButton(interaction, data, guildData, mediaId) {
   list.push({ mediaId, title, siteUrl: media.siteUrl });
   await saveData(data);
   await interaction.editReply({
-    content: `❤️ Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`,
+    content: `🤍 Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`,
   });
 }
 
@@ -563,6 +643,31 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
       }
     }
     rec.recommendedBy.push(userId);
+  }
+
+  // Global (cross-server) tally — one vote per user per anime no matter how
+  // many servers they're a member of. A user's vote only drops out of the
+  // global tally once they've un-recommended it in EVERY server they're
+  // tracked in, not just this one.
+  if (!data.globalRecommendations) data.globalRecommendations = {};
+  if (!data.globalRecommendations[mediaId]) {
+    data.globalRecommendations[mediaId] = { title: rec.title, siteUrl: rec.siteUrl, recommendedBy: [] };
+  }
+  const globalRec = data.globalRecommendations[mediaId];
+  if (rec.title) {
+    globalRec.title = rec.title;
+    globalRec.siteUrl = rec.siteUrl;
+  }
+
+  if (alreadyRecommended) {
+    const stillRecommendedElsewhere = Object.values(data.guilds).some(
+      (g) => g.recommendations?.[mediaId]?.recommendedBy?.includes(userId)
+    );
+    if (!stillRecommendedElsewhere) {
+      globalRec.recommendedBy = globalRec.recommendedBy.filter((id) => id !== userId);
+    }
+  } else if (!globalRec.recommendedBy.includes(userId)) {
+    globalRec.recommendedBy.push(userId);
   }
 
   await saveData(data);
@@ -604,25 +709,28 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
 }
 
 function buildActivityButtons(mediaId, recommendCount = 0) {
-  const watchLaterBtn = new ButtonBuilder()
-    .setCustomId(`wl_${mediaId}`)
-    .setLabel('Watch Later')
-    .setEmoji('📌')
-    .setStyle(ButtonStyle.Secondary);
-
-  const favoriteBtn = new ButtonBuilder()
-    .setCustomId(`fav_${mediaId}`)
-    .setLabel('Favorite')
-    .setEmoji('❤️')
-    .setStyle(ButtonStyle.Danger);
-
+  // Order: Recommend, Favorite, Watch later.
   const recommendBtn = new ButtonBuilder()
     .setCustomId(`rec_${mediaId}`)
     .setLabel(recommendCount ? `Recommend • ${recommendCount}` : 'Recommend')
     .setEmoji('⭐')
-    .setStyle(ButtonStyle.Success);
+    .setStyle(ButtonStyle.Primary); // blue
 
-  return new ActionRowBuilder().addComponents(watchLaterBtn, favoriteBtn, recommendBtn);
+  // Discord only offers 5 built-in button colors (blurple/grey/green/red/link)
+  // — there's no true pink — so Danger (red) is the closest stand-in here.
+  const favoriteBtn = new ButtonBuilder()
+    .setCustomId(`fav_${mediaId}`)
+    .setLabel('Favorite')
+    .setEmoji('🤍')
+    .setStyle(ButtonStyle.Danger);
+
+  const watchLaterBtn = new ButtonBuilder()
+    .setCustomId(`wl_${mediaId}`)
+    .setLabel('Watch later')
+    .setEmoji('📌')
+    .setStyle(ButtonStyle.Secondary);
+
+  return new ActionRowBuilder().addComponents(recommendBtn, favoriteBtn, watchLaterBtn);
 }
 
 // Only mentions the recommend count when there's actually at least one — an
@@ -758,7 +866,7 @@ async function buildEmbed(username, avatarUrl, activity, streak, seasonInfo) {
   // also the only way to have the streak appear on the same row as the
   // avatar icon, since that icon only exists in the Author field.
   const authorOpts = {
-    name: `✦ ${username}   🔥 ${streak || 1}`,
+    name: `✦ ${username} 🔥 ${streak || 1}`,
     url: `https://anilist.co/user/${username}`,
   };
   if (avatarUrl) authorOpts.iconURL = avatarUrl;
@@ -798,7 +906,7 @@ async function buildEmbed(username, avatarUrl, activity, streak, seasonInfo) {
       infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
     }
     if (activity.media.isAdult) infoBits.push('🔞 Mature');
-    if (popularityRank) infoBits.push(`🌍 #${popularityRank} Most Popular`);
+    if (popularityRank) infoBits.push(`❤️ #${popularityRank} Most Popular`);
     const infoLine = infoBits.join('  •  ');
 
     const synopsis = truncate(stripDescription(activity.media.description), 160);
