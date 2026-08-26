@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AniTracker — Dashboard</title>
+<link rel="stylesheet" href="/dashboard/styles.css" />
+</head>
+<body>
+
+<div id="blob-bg" aria-hidden="true"></div>
+
+<!-- LOGIN -->
+<section id="login-screen" class="login-screen">
+  <div class="login-card">
+    <div class="brand">
+      <span class="brand-mark">✦</span>
+      <span class="brand-name">AniTracker</span>
+    </div>
+    <p class="login-sub">Developer Portal</p>
+    <form id="login-form">
+      <label for="password-input">Password</label>
+      <input id="password-input" type="password" autocomplete="current-password" required />
+      <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+      <p id="login-error" class="error-text" hidden></p>
+    </form>
+  </div>
+</section>
+
+<!-- APP -->
+<div id="app" class="app" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">✦</span>
+      <span class="brand-name">AniTracker</span>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview">Overview</button>
+      <button class="nav-item" data-view="servers">Servers</button>
+      <button class="nav-item" data-view="users">Tracked Users</button>
+      <button class="nav-item" data-view="activity">Recent Activity</button>
+      <button class="nav-item" data-view="leaderboards">Leaderboards</button>
+      <button class="nav-item" data-view="send">Send Message</button>
+      <button class="nav-item" data-view="controls">Bot Controls</button>
+    </nav>
+    <button id="logout-btn" class="btn btn-ghost btn-block">Log out</button>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="view-title">Overview</h1>
+      <div id="bot-status-pill" class="status-pill status-running">● Running</div>
+    </header>
+
+    <!-- OVERVIEW -->
+    <section data-view-panel="overview" class="view-panel">
+      <div class="stat-grid" id="overview-stats"></div>
+      <div class="card" id="overview-bot-card"></div>
+    </section>
+
+    <!-- SERVERS -->
+    <section data-view-panel="servers" class="view-panel" hidden>
+      <div class="card">
+        <div class="card-header"><h2>Servers</h2><span id="servers-count" class="badge"></span></div>
+        <div id="servers-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- TRACKED USERS -->
+    <section data-view-panel="users" class="view-panel" hidden>
+      <div class="card">
+        <div class="card-header"><h2>Tracked AniList Users</h2><span id="users-count" class="badge"></span></div>
+        <div id="users-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- ACTIVITY -->
+    <section data-view-panel="activity" class="view-panel" hidden>
+      <div class="card">
+        <div class="card-header"><h2>Recent Activity</h2></div>
+        <div id="activity-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- LEADERBOARDS -->
+    <section data-view-panel="leaderboards" class="view-panel" hidden>
+      <div class="tabs">
+        <button class="tab active" data-tab="recommended">Most Recommended</button>
+        <button class="tab" data-tab="watched">Most Watched</button>
+        <button class="tab" data-tab="watchlater">Watch Later</button>
+        <button class="tab" data-tab="linked">Linked AniList Accounts</button>
+      </div>
+      <div class="card">
+        <p id="leaderboard-note" class="muted-note"></p>
+        <div id="leaderboard-content" class="list"></div>
+      </div>
+    </section>
+
+    <!-- SEND MESSAGE -->
+    <section data-view-panel="send" class="view-panel" hidden>
+      <div class="card card-narrow">
+        <h2>Send a Message</h2>
+        <label for="send-guild">Server</label>
+        <select id="send-guild"></select>
+        <label for="send-channel">Channel</label>
+        <select id="send-channel"></select>
+        <label for="send-message">Message</label>
+        <textarea id="send-message" rows="5" placeholder="Type what AniTracker should post…"></textarea>
+        <button id="send-btn" class="btn btn-primary">Send as AniTracker</button>
+        <p id="send-result" class="muted-note"></p>
+      </div>
+    </section>
+
+    <!-- CONTROLS -->
+    <section data-view-panel="controls" class="view-panel" hidden>
+      <div class="card card-narrow">
+        <h2>Bot Controls</h2>
+        <div class="control-row">
+          <div>
+            <p class="control-title">Polling</p>
+            <p class="muted-note">Pausing stops AniList polling &amp; new activity posts. Slash commands still work.</p>
+          </div>
+          <button id="pause-resume-btn" class="btn btn-primary">Pause</button>
+        </div>
+        <div class="control-row">
+          <div>
+            <p class="control-title">Redeploy</p>
+            <p class="muted-note">Triggers your Render deploy hook.</p>
+          </div>
+          <button id="redeploy-btn" class="btn btn-danger">Redeploy</button>
+        </div>
+        <p id="controls-result" class="muted-note"></p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/dashboard/app.js"></script>
+</body>
+</html>
