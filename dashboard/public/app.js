@@ -32,6 +32,36 @@ function timeAgo(dateStr) {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+/* ---------------- Loading helpers ---------------- */
+
+// Fills a container with N shimmer rows while its real data is in flight, so
+// a view swap never flashes an empty panel. Cleared by the render's own
+// innerHTML reset once the data lands.
+function showSkeletonRows(container, count = 4) {
+  if (!container) return;
+  container.innerHTML = Array.from({ length: count }, () => '<div class="skeleton skeleton-row"></div>').join('');
+}
+
+function showSkeletonStats(container, count = 5) {
+  if (!container) return;
+  container.innerHTML = Array.from({ length: count }, () => '<div class="skeleton skeleton-stat"></div>').join('');
+}
+
+// Wraps an async click handler so the button disables + shows a spinner for
+// the duration, preventing double-submits on Send / Pause / Redeploy.
+async function withButtonLoading(btn, fn) {
+  if (!btn) return fn();
+  const wasDisabled = btn.disabled;
+  btn.disabled = true;
+  btn.classList.add('is-loading');
+  try {
+    return await fn();
+  } finally {
+    btn.classList.remove('is-loading');
+    btn.disabled = wasDisabled;
+  }
+}
+
 /* ---------------- Auth ---------------- */
 
 function showLogin() {
@@ -50,9 +80,12 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const password = document.getElementById('password-input').value;
   const errorEl = document.getElementById('login-error');
+  const submitBtn = e.target.querySelector('button[type="submit"]');
   errorEl.hidden = true;
   try {
-    await api('/login', { method: 'POST', body: JSON.stringify({ password }) });
+    await withButtonLoading(submitBtn, () =>
+      api('/login', { method: 'POST', body: JSON.stringify({ password }) })
+    );
     showApp();
   } catch (err) {
     errorEl.textContent = err.message;
@@ -89,9 +122,12 @@ function setStoredCollapse(val) {
 const sidebarEl = document.querySelector('.sidebar');
 if (getStoredCollapse()) sidebarEl.classList.add('sidebar-collapsed');
 
-document.getElementById('sidebar-toggle').addEventListener('click', () => {
+const sidebarToggleBtn = document.getElementById('sidebar-toggle');
+sidebarToggleBtn.setAttribute('aria-expanded', String(!sidebarEl.classList.contains('sidebar-collapsed')));
+sidebarToggleBtn.addEventListener('click', () => {
   const collapsed = sidebarEl.classList.toggle('sidebar-collapsed');
   setStoredCollapse(collapsed);
+  sidebarToggleBtn.setAttribute('aria-expanded', String(!collapsed));
 });
 
 /* ---------------- Nav ---------------- */
@@ -117,7 +153,12 @@ document.querySelectorAll('[data-goto-view]').forEach((btn) => {
 });
 
 function loadView(view) {
-  document.querySelectorAll('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  document.querySelectorAll('.nav-item').forEach((b) => {
+    const active = b.dataset.view === view;
+    b.classList.toggle('active', active);
+    if (active) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
   document.querySelectorAll('.view-panel').forEach((p) => (p.hidden = p.dataset.viewPanel !== view));
   document.getElementById('view-title').textContent = viewTitles[view] || view;
 
@@ -136,6 +177,9 @@ function loadView(view) {
 const RENDER_DASHBOARD_URL = 'https://dashboard.render.com/web/srv-d9pbdp2jnfac73ebhdq0';
 
 async function renderOverview() {
+  showSkeletonStats(document.getElementById('overview-stats'), 5);
+  showSkeletonRows(document.getElementById('overview-activity-list'), 5);
+
   const data = await api('/overview');
   updateStatusPill(data.botPaused);
 
@@ -206,6 +250,7 @@ function updateStatusPill(paused) {
 /* ---------------- Servers ---------------- */
 
 async function renderServers() {
+  showSkeletonRows(document.getElementById('servers-list'), 5);
   const { servers } = await api('/servers');
   document.getElementById('servers-count').textContent = servers.length;
   const list = document.getElementById('servers-list');
@@ -230,6 +275,7 @@ async function renderServers() {
 /* ---------------- Users ---------------- */
 
 async function renderUsers() {
+  showSkeletonRows(document.getElementById('users-list'), 5);
   const { users, total } = await api('/users');
   document.getElementById('users-count').textContent = total;
   const list = document.getElementById('users-list');
@@ -266,6 +312,7 @@ function activityRow(a) {
 }
 
 async function renderActivity() {
+  showSkeletonRows(document.getElementById('activity-list'), 8);
   const { activity } = await api('/activity?limit=100');
   const list = document.getElementById('activity-list');
   list.innerHTML = '';
@@ -287,11 +334,12 @@ document.querySelectorAll('.tab').forEach((tab) => {
 async function renderLeaderboard(tab) {
   const content = document.getElementById('leaderboard-content');
   const noteEl = document.getElementById('leaderboard-note');
-  content.innerHTML = '';
+  showSkeletonRows(content, 6);
   noteEl.textContent = '';
 
   if (tab === 'recommended' || tab === 'watched') {
     const { list, note } = await api(`/leaderboards/${tab}`);
+    content.innerHTML = '';
     noteEl.textContent = note || '';
     if (!list.length) return content.appendChild(el('<div class="empty-state">Nothing yet.</div>'));
     list.forEach((item, i) => {
@@ -309,6 +357,7 @@ async function renderLeaderboard(tab) {
     });
   } else if (tab === 'watchlater') {
     const { users } = await api('/leaderboards/watchlater');
+    content.innerHTML = '';
     if (!users.length) return content.appendChild(el('<div class="empty-state">No watch-later lists yet.</div>'));
     for (const u of users) {
       content.appendChild(
@@ -325,6 +374,7 @@ async function renderLeaderboard(tab) {
     }
   } else if (tab === 'linked') {
     const { accounts, note } = await api('/leaderboards/linked');
+    content.innerHTML = '';
     noteEl.textContent = note || '';
     if (!accounts.length) return content.appendChild(el('<div class="empty-state">No linked AniList accounts yet — coming with /signin.</div>'));
     for (const a of accounts) {
@@ -393,14 +443,16 @@ function feedbackCard(f) {
 
 async function renderFeedback(tab) {
   const list = document.getElementById('feedback-list');
-  list.innerHTML = '';
+  showSkeletonRows(list, 4);
   let feedback;
   try {
     ({ feedback } = await api('/feedback'));
   } catch (err) {
+    list.innerHTML = '';
     list.appendChild(el(`<div class="empty-state">Could not load feedback: ${escapeHtml(err.message)}</div>`));
     return;
   }
+  list.innerHTML = '';
 
   const filtered =
     tab === 'all' ? feedback : tab === 'new' ? feedback.filter((f) => !f.status) : feedback.filter((f) => f.status === tab);
@@ -428,14 +480,16 @@ async function wireSendForm({ guildSelect, channelSelect, messageEl, sendBtn, re
   sendBtn.onclick = async () => {
     resultEl.textContent = 'Sending…';
     try {
-      await api('/send', {
-        method: 'POST',
-        body: JSON.stringify({
-          guildId: guildSelect.value,
-          channelId: channelSelect.value,
-          message: messageEl.value,
-        }),
-      });
+      await withButtonLoading(sendBtn, () =>
+        api('/send', {
+          method: 'POST',
+          body: JSON.stringify({
+            guildId: guildSelect.value,
+            channelId: channelSelect.value,
+            message: messageEl.value,
+          }),
+        })
+      );
       resultEl.textContent = 'Sent ✓';
       messageEl.value = '';
     } catch (err) {
@@ -464,7 +518,9 @@ async function renderControls() {
   btn.onclick = async () => {
     const resultEl = document.getElementById('controls-result');
     try {
-      const { botPaused: nowPaused } = await api(botPaused ? '/resume' : '/pause', { method: 'POST' });
+      const { botPaused: nowPaused } = await withButtonLoading(btn, () =>
+        api(botPaused ? '/resume' : '/pause', { method: 'POST' })
+      );
       updateStatusPill(nowPaused);
       resultEl.textContent = nowPaused ? 'Bot paused.' : 'Bot resumed.';
       renderControls();
@@ -473,12 +529,13 @@ async function renderControls() {
     }
   };
 
-  document.getElementById('redeploy-btn').onclick = async () => {
+  const redeployBtn = document.getElementById('redeploy-btn');
+  redeployBtn.onclick = async () => {
     const resultEl = document.getElementById('controls-result');
     if (!confirm('Trigger a redeploy on Render now?')) return;
     resultEl.textContent = 'Triggering redeploy…';
     try {
-      await api('/redeploy', { method: 'POST' });
+      await withButtonLoading(redeployBtn, () => api('/redeploy', { method: 'POST' }));
       resultEl.textContent = 'Redeploy triggered ✓';
     } catch (err) {
       resultEl.textContent = `Error: ${err.message}`;

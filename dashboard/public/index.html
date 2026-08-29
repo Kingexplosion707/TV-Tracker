@@ -3,7 +3,11 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>AniTracker — Dashboard</title>
+<meta name="color-scheme" content="dark" />
+<title>AniTracker — Developer Portal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" />
 <link rel="stylesheet" href="/dashboard/styles.css" />
 </head>
 <body>
@@ -31,7 +35,7 @@
 <div id="app" class="app" hidden>
   <aside class="sidebar">
     <div class="sidebar-top">
-      <button id="sidebar-toggle" class="icon-btn" aria-label="Toggle sidebar" title="Toggle sidebar">
+      <button id="sidebar-toggle" class="icon-btn" aria-label="Toggle sidebar" aria-expanded="true" title="Toggle sidebar">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <div class="brand">
@@ -39,8 +43,8 @@
         <span class="brand-name">AniTracker</span>
       </div>
     </div>
-    <nav class="nav">
-      <button class="nav-item active" data-view="overview">
+    <nav class="nav" aria-label="Primary">
+      <button class="nav-item active" data-view="overview" aria-current="page">
         <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></span>
         <span class="nav-label">Overview</span>
       </button>
@@ -82,7 +86,7 @@
   <main class="main">
     <header class="topbar">
       <h1 id="view-title">Overview</h1>
-      <div id="bot-status-pill" class="status-pill status-running">● Running</div>
+      <div id="bot-status-pill" class="status-pill status-running" role="status" aria-live="polite">● Running</div>
     </header>
 
     <!-- OVERVIEW -->
@@ -106,7 +110,7 @@
           <label for="overview-send-message">Message</label>
           <textarea id="overview-send-message" rows="3" placeholder="Type what AniTracker should post…"></textarea>
           <button id="overview-send-btn" class="btn btn-primary btn-block">Send as AniTracker</button>
-          <p id="overview-send-result" class="muted-note"></p>
+          <p id="overview-send-result" class="muted-note" role="status" aria-live="polite"></p>
         </div>
       </div>
     </section>
@@ -172,7 +176,7 @@
         <label for="send-message">Message</label>
         <textarea id="send-message" rows="5" placeholder="Type what AniTracker should post…"></textarea>
         <button id="send-btn" class="btn btn-primary">Send as AniTracker</button>
-        <p id="send-result" class="muted-note"></p>
+        <p id="send-result" class="muted-note" role="status" aria-live="polite"></p>
       </div>
     </section>
 
@@ -194,7 +198,7 @@
           </div>
           <button id="redeploy-btn" class="btn btn-danger">Redeploy</button>
         </div>
-        <p id="controls-result" class="muted-note"></p>
+        <p id="controls-result" class="muted-note" role="status" aria-live="polite"></p>
       </div>
     </section>
   </main>
