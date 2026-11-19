@@ -47,29 +47,6 @@ function formatDate(d) {
   return String(d.year);
 }
 
-function cleanDescription(text, max) {
-  if (!text) return '';
-  const cleaned = text
-    .replace(/~!.*?!~/gs, '') // AniList spoiler blocks — never show these
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/?[a-z][^>]*>/gi, '')
-    .replace(/\(Source:[^)]*\)/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/[ \t]+/g, ' ')
-    .trim();
-  if (cleaned.length <= max) return cleaned;
-  const cut = cleaned.slice(0, max);
-  const lastStop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('.\n'));
-  return `${lastStop > max * 0.6 ? cut.slice(0, lastStop + 1) : cut.trimEnd()}…`;
-}
-
-function compactNumber(n) {
-  if (typeof n !== 'number') return null;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
-  return String(n);
-}
-
 function trailerUrl(trailer) {
   if (!trailer?.id) return null;
   if (trailer.site === 'youtube') return `https://www.youtube.com/watch?v=${trailer.id}`;
@@ -98,11 +75,10 @@ function buildMoreInfo(media, extra = {}) {
 
   const headerBits = [FORMAT_LABELS[media.format] || prettyEnum(media.format), STATUS_LABELS[media.status]].filter(Boolean);
 
+  // Everything already on the activity post (cover, score, genres, popularity
+  // rank, mature tag, synopsis) is deliberately left out here — this panel
+  // only adds what the post doesn't show, in a tidy 3-column grid.
   const altTitle = media.title?.native || (media.title?.english && media.title?.romaji !== media.title?.english ? media.title.romaji : null);
-  const synopsis = cleanDescription(media.description, 420);
-  const descParts = [];
-  if (altTitle) descParts.push(`*${altTitle}*`);
-  if (synopsis) descParts.push(synopsis);
 
   const main = new EmbedBuilder()
     .setColor(color)
@@ -111,29 +87,25 @@ function buildMoreInfo(media, extra = {}) {
     .setFooter({ text: 'Only you can see this • Data from AniList' });
 
   if (headerBits.length) main.setAuthor({ name: headerBits.join('  •  ') });
-  if (descParts.length) main.setDescription(truncate(descParts.join('\n\n'), 4000));
-  if (media.coverImage?.extraLarge || media.coverImage?.large) {
-    main.setThumbnail(media.coverImage.extraLarge || media.coverImage.large);
-  }
+  if (altTitle) main.setDescription(`*${truncate(altTitle, 200)}*`);
   if (media.bannerImage) main.setImage(media.bannerImage);
 
   const fields = [];
 
-  // Length
+  // Row 1: length · seasons · dates
   if (isManga) {
-    const ch = media.chapters ? `${media.chapters} chapters` : media.status === 'RELEASING' ? 'Ongoing' : '?';
+    const ch = media.chapters ? `${media.chapters} chapters` : media.status === 'RELEASING' ? 'Ongoing' : 'Unknown';
     const vol = media.volumes ? `${media.volumes} volumes` : null;
-    fields.push({ name: '📖 Length', value: [ch, vol].filter(Boolean).join(' • '), inline: true });
+    fields.push({ name: '📖 Length', value: [ch, vol].filter(Boolean).join('\n'), inline: true });
   } else {
     let eps;
     if (media.episodes) eps = `${media.episodes} episode${media.episodes === 1 ? '' : 's'}`;
-    else if (media.nextAiringEpisode) eps = `${media.nextAiringEpisode.episode - 1}+ so far`;
-    else eps = '?';
+    else if (media.nextAiringEpisode) eps = `${media.nextAiringEpisode.episode - 1} so far`;
+    else eps = 'Unknown';
     const dur = media.duration ? `${media.duration} min${media.episodes === 1 ? '' : ' each'}` : null;
-    fields.push({ name: '📺 Episodes', value: [eps, dur].filter(Boolean).join(' • '), inline: true });
+    fields.push({ name: '📺 Episodes', value: [eps, dur].filter(Boolean).join('\n'), inline: true });
   }
 
-  // Seasons in the franchise
   if (!isManga && extra.totalSeasons) {
     const value =
       extra.seasonNumber && extra.totalSeasons > 1
@@ -142,51 +114,28 @@ function buildMoreInfo(media, extra = {}) {
     fields.push({ name: '🗂️ Seasons', value, inline: true });
   }
 
-  // Dates
   const start = formatDate(media.startDate);
   const end = formatDate(media.endDate);
   const seasonTag = media.season && media.seasonYear ? `${prettyEnum(media.season)} ${media.seasonYear}` : null;
   if (start || seasonTag) {
-    let value = start ? (end && end !== start ? `${start} → ${end}` : media.status === 'RELEASING' ? `${start} → now` : start) : seasonTag;
-    if (seasonTag && start) value = `${seasonTag}\n${value}`;
-    fields.push({ name: isManga ? '📅 Published' : '📅 Aired', value, inline: true });
+    const range = start ? (end && end !== start ? `${start} → ${end}` : media.status === 'RELEASING' ? `${start} → now` : start) : null;
+    fields.push({ name: isManga ? '📅 Published' : '📅 Aired', value: [seasonTag, range].filter(Boolean).join('\n'), inline: true });
   }
 
-  // Next episode countdown (live Discord timestamp)
+  // Row 2: next episode · studio · source
   if (media.nextAiringEpisode?.airingAt) {
-    fields.push({
-      name: '⏭️ Next episode',
-      value: `Ep ${media.nextAiringEpisode.episode} <t:${media.nextAiringEpisode.airingAt}:R>`,
-      inline: true,
-    });
+    fields.push({ name: '⏭️ Next episode', value: `Ep ${media.nextAiringEpisode.episode}\n<t:${media.nextAiringEpisode.airingAt}:R>`, inline: true });
   }
-
-  // Score
-  if (media.averageScore) {
-    fields.push({ name: '⭐ Score', value: `${(media.averageScore / 10).toFixed(1)}/10`, inline: true });
-  }
-
-  // Popularity
-  const popRank = media.rankings?.find((r) => r.type === 'POPULAR' && r.allTime);
-  const popBits = [];
-  if (popRank && popRank.rank <= 1000) popBits.push(`#${popRank.rank} all time`);
-  if (media.popularity) popBits.push(`${compactNumber(media.popularity)} members`);
-  if (popBits.length) fields.push({ name: '❤️ Popularity', value: popBits.join('\n'), inline: true });
-
-  // Studio / source
   const studio = media.studios?.nodes?.[0];
   if (studio) fields.push({ name: '🏢 Studio', value: studio.siteUrl ? `[${studio.name}](${studio.siteUrl})` : studio.name, inline: true });
   if (media.source) fields.push({ name: '📚 Source', value: prettyEnum(media.source), inline: true });
-  if (media.favourites) fields.push({ name: '💖 Favourited', value: `${compactNumber(media.favourites)} times`, inline: true });
 
-  if (media.genres?.length) {
-    fields.push({ name: '🎭 Genres', value: media.genres.slice(0, 6).join(', '), inline: false });
-  }
+  // Full width: tags (spoiler-free, and only ones AniList rates as relevant)
   const tags = (media.tags || [])
     .filter((t) => !t.isMediaSpoiler && !t.isGeneralSpoiler && t.rank >= 60)
     .slice(0, 6)
     .map((t) => t.name);
-  if (tags.length) fields.push({ name: '🏷️ Tags', value: tags.join(', '), inline: false });
+  if (tags.length) fields.push({ name: '🏷️ Tags', value: tags.join(' · '), inline: false });
 
   main.addFields(fields.slice(0, 25));
 

@@ -44,6 +44,18 @@ const commands = [
       .setRequired(false)
       .addChoices({ name: 'On — post my activity', value: 'on' }, { name: 'Off — stop posting my activity', value: 'off' })
   ),
+  base('update', 'Post an update notice in this server silently (no notifications)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((opt) =>
+      opt.setName('message').setDescription('Custom message — leave empty to post the latest AniTracker changelog').setRequired(false).setMaxLength(1800)
+    )
+    .addChannelOption((opt) =>
+      opt
+        .setName('channel')
+        .setDescription('Where to post (defaults to the AniTracker channel)')
+        .setRequired(false)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+    ),
   base('feedback', 'Rate AniTracker and send feedback to the developer'),
   base('help', 'All AniTracker commands and buttons'),
 ].map((c) => c.toJSON());

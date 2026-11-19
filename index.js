@@ -30,6 +30,7 @@ const { buildOAuthRouter, signInUrlFor, isOAuthConfigured } = require('./oauth')
 const { buildMoreInfo } = require('./moreInfo');
 const feedback = require('./feedback');
 const { commands: slashCommands } = require('./commands');
+const { LATEST_UPDATE } = require('./changelog');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
 const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on relaunch
@@ -81,6 +82,9 @@ const warnedChannels = new Set();
 // Polling can be paused from the dashboard. Backed by data.botPaused.
 let isPaused = false;
 let pollRunning = false;
+// Result of the last slash-command sync — shown on /health so a failed
+// registration is visible without digging through logs.
+let commandSync = { ok: null, count: 0, error: null, at: null, clearedGuilds: 0 };
 const botStartedAt = Date.now();
 
 /* ---------------------------------------------------------------------------
@@ -131,6 +135,7 @@ app.get('/health', (req, res) => {
     storage: isStorageHealthy() ? 'ok' : 'unavailable',
     uptimeSeconds: Math.floor((Date.now() - botStartedAt) / 1000),
     memoryMB: Math.round(mem.rss / 1024 / 1024),
+    commands: commandSync,
   });
 });
 
@@ -223,6 +228,36 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000).unref();
 
+// Registers the global slash commands, then removes any old server-only
+// copies (left over from running deploy-commands with GUILD_ID), which
+// would otherwise shadow/duplicate the global ones in that server.
+async function syncCommands() {
+  commandSync = { ok: null, count: 0, error: null, at: new Date().toISOString(), clearedGuilds: 0 };
+  try {
+    const registered = await client.application.commands.set(slashCommands);
+    commandSync.ok = true;
+    commandSync.count = registered.size;
+    console.log(`Registered ${registered.size} global slash commands: ${[...registered.values()].map((c) => c.name).join(', ')}`);
+  } catch (e) {
+    commandSync.ok = false;
+    commandSync.error = `${e.code || ''} ${e.message}`.trim().slice(0, 500);
+    console.error('Failed to register global slash commands:', e.rawError ? JSON.stringify(e.rawError) : e.message);
+    return;
+  }
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const existing = await guild.commands.fetch();
+      if (existing.size) {
+        await guild.commands.set([]);
+        commandSync.clearedGuilds += 1;
+        console.log(`Cleared ${existing.size} stale server-only command(s) in ${guild.name}`);
+      }
+    } catch (e) {
+      console.warn(`Couldn't check server commands in ${guild.name}:`, e.message);
+    }
+  }
+}
+
 function getInviteUrl() {
   const id = client.user?.id || process.env.CLIENT_ID;
   if (!id) return null;
@@ -237,12 +272,7 @@ client.once(Events.ClientReady, async () => {
   }
   // Keep Discord's global command list in sync with commands.js on every
   // start, so new/changed commands go live with a normal deploy.
-  try {
-    await client.application.commands.set(slashCommands);
-    console.log(`Registered ${slashCommands.length} slash commands globally.`);
-  } catch (e) {
-    console.error('Failed to register slash commands:', e.message);
-  }
+  await syncCommands();
 
   const data = await loadData();
   isPaused = data.botPaused;
@@ -548,6 +578,8 @@ async function handleSlashCommand(interaction) {
         return await handleTracking(interaction, data);
       case 'help':
         return await handleHelp(interaction);
+      case 'update':
+        return await handleUpdate(interaction, guildData);
       default:
         return await respond(interaction, { content: 'Unknown command — try `/help`.', flags: EPHEMERAL });
     }
@@ -1052,7 +1084,7 @@ async function handleHelp(interaction) {
           '`/favorites` — anyone’s AniList favourites',
         ].join('\n'),
       },
-      { name: '💬 Other', value: '`/feedback` — rate AniTracker & tell the developer anything' },
+      { name: '💬 Other', value: '`/feedback` — rate AniTracker & tell the developer anything\n`/update` — post an update notice silently *(Manage Server)*' },
       {
         name: '🔘 Buttons on activity posts',
         value: '⭐ Recommend · 🤍 Favorite · 📌 Watch later · ℹ️ More info (only you see it)\nReact to a post and its owner gets a private DM.',
@@ -1063,6 +1095,56 @@ async function handleHelp(interaction) {
     ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Add AniTracker to a server').setURL(invite))]
     : [];
   await respond(interaction, { embeds: [embed], components, flags: EPHEMERAL });
+}
+
+/* ----- /update (silent announcement in this server) ----- */
+async function handleUpdate(interaction, guildData) {
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    await respond(interaction, { content: 'You need the **Manage Server** permission to do that.', flags: EPHEMERAL });
+    return;
+  }
+  const custom = interaction.options.getString('message')?.trim();
+  const picked = interaction.options.getChannel('channel');
+  const channel =
+    picked ||
+    (guildData.channelId ? await client.channels.fetch(guildData.channelId).catch(() => null) : null) ||
+    interaction.channel;
+  if (!channel?.isTextBased?.()) {
+    await respond(interaction, { content: 'Pick a text channel to post in.', flags: EPHEMERAL });
+    return;
+  }
+  const missing = missingChannelPerms(channel);
+  if (missing.length) {
+    await respond(interaction, { content: `I can't post in <#${channel.id}> — missing **${missing.map(prettyPerm).join(', ')}**.`, flags: EPHEMERAL });
+    return;
+  }
+
+  const embed = new EmbedBuilder().setColor(DEFAULT_COLOR).setTimestamp(new Date());
+  if (custom) {
+    embed
+      .setAuthor({ name: 'AniTracker update', iconURL: client.user.displayAvatarURL({ size: 64 }) })
+      .setDescription(custom.replace(/\\n/g, '\n'))
+      .setFooter({ text: `Posted by ${interaction.member?.displayName || interaction.user.username}` });
+  } else {
+    embed
+      .setTitle(LATEST_UPDATE.title)
+      .setThumbnail(client.user.displayAvatarURL({ size: 128 }))
+      .setDescription(LATEST_UPDATE.items.map((i) => `• ${i}`).join('\n'))
+      .setFooter({ text: LATEST_UPDATE.footer });
+  }
+
+  try {
+    await channel.send({
+      embeds: [embed],
+      // @silent: shows normally, but no push notification or sound for anyone.
+      flags: MessageFlags.SuppressNotifications,
+      allowedMentions: { parse: [] },
+    });
+  } catch (e) {
+    await respond(interaction, { content: `Couldn't post: ${e.message}`, flags: EPHEMERAL });
+    return;
+  }
+  await respond(interaction, { content: `🔕 Posted ${custom ? 'your update' : 'the latest changelog'} silently in <#${channel.id}>.`, flags: EPHEMERAL });
 }
 
 /* ----- /feedback ----- */
