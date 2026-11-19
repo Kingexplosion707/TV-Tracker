@@ -162,14 +162,28 @@ function loadView(view) {
   document.querySelectorAll('.view-panel').forEach((p) => (p.hidden = p.dataset.viewPanel !== view));
   document.getElementById('view-title').textContent = viewTitles[view] || view;
 
-  if (view === 'overview') renderOverview();
-  else if (view === 'servers') renderServers();
-  else if (view === 'users') renderUsers();
-  else if (view === 'activity') renderActivity();
-  else if (view === 'leaderboards') renderLeaderboard(currentTab);
-  else if (view === 'feedback') renderFeedback(currentFeedbackTab);
-  else if (view === 'send') renderSend();
-  else if (view === 'controls') renderControls();
+  const renderers = {
+    overview: renderOverview,
+    servers: renderServers,
+    users: renderUsers,
+    activity: renderActivity,
+    leaderboards: () => renderLeaderboard(currentTab),
+    feedback: () => renderFeedback(currentFeedbackTab),
+    send: renderSend,
+    controls: renderControls,
+  };
+  const fn = renderers[view];
+  if (!fn) return;
+  // A failed request must never leave a panel stuck on loading shimmers.
+  Promise.resolve()
+    .then(fn)
+    .catch((err) => {
+      if (err.message === 'Not authenticated') return;
+      const panel = document.querySelector(`[data-view-panel="${view}"]`);
+      panel?.querySelectorAll('.skeleton').forEach((sk) => sk.remove());
+      const box = panel?.querySelector('.list') || panel;
+      if (box) box.prepend(el(`<div class="empty-state">Could not load this view: ${escapeHtml(err.message)}</div>`));
+    });
 }
 
 /* ---------------- Overview ---------------- */
@@ -188,6 +202,7 @@ async function renderOverview() {
   const cards = [
     ['Servers', data.totalServers],
     ['Tracked Users', data.totalTrackedUsers],
+    ['Linked Accounts', data.linkedAccounts ?? 0],
     ['Recommend Votes', data.totalRecommendations],
     ['Pending Feedback', data.pendingFeedback ?? 0],
     ['Uptime', formatUptime(data.uptimeSeconds)],
@@ -204,12 +219,16 @@ async function renderOverview() {
       ${data.botAvatar ? `<img class="avatar" src="${data.botAvatar}" />` : ''}
       <div class="row-main">
         <div class="row-title">${data.botTag || 'AniTracker'}</div>
-        <div class="row-sub">${data.botPaused ? 'Polling paused' : 'Polling every few minutes'}</div>
+        <div class="row-sub">${data.botPaused ? 'Polling paused' : 'Polling every few minutes'} · ${data.memoryMB ?? '?'} MB RAM · storage ${
+          data.storage?.healthy ? escapeHtml(data.storage.backend) : '<span class="text-danger">UNAVAILABLE (read-only)</span>'
+        }</div>
       </div>
+      ${data.inviteUrl ? `<a class="btn btn-ghost btn-small" href="${data.inviteUrl}" target="_blank" rel="noopener">Invite link</a>` : ''}
       <a class="btn btn-ghost btn-small" href="${RENDER_DASHBOARD_URL}" target="_blank" rel="noopener">Open on Render →</a>
     </div>
   `)
   );
+  botCard.appendChild(restartHistory(data.restarts || []));
 
   await renderOverviewActivitySnippet();
   wireSendForm({
@@ -233,7 +252,45 @@ async function renderOverviewActivitySnippet() {
   }
 }
 
+// Recent process starts, and how each one ended — the quickest way to tell a
+// normal deploy apart from a crash / out-of-memory kill.
+function restartHistory(restarts) {
+  const wrapEl = el('<div class="restart-history"><h3>Recent restarts</h3><div class="list"></div></div>');
+  const list = wrapEl.querySelector('.list');
+  if (!restarts.length) {
+    list.appendChild(el('<div class="empty-state">No restart history recorded yet.</div>'));
+    return wrapEl;
+  }
+  restarts.forEach((r, i) => {
+    let label, cls;
+    if (i === 0 && !r.endedAt) {
+      label = 'Running now';
+      cls = 'feedback-badge-resolved';
+    } else if (r.reason && r.reason.startsWith('unexpected')) {
+      label = 'Crashed / killed';
+      cls = 'feedback-badge-disputed';
+    } else {
+      label = 'Clean stop';
+      cls = 'feedback-badge-new';
+    }
+    const ran = r.endedAt ? formatUptime((new Date(r.endedAt) - new Date(r.startedAt)) / 1000) : null;
+    list.appendChild(
+      el(`<div class="list-row">
+        <span class="badge ${cls}">${label}</span>
+        <div class="row-main">
+          <div class="row-title">Started ${new Date(r.startedAt).toLocaleString()}</div>
+          <div class="row-sub">${r.commit ? `commit ${escapeHtml(r.commit)} · ` : ''}${ran ? `ran ${ran} · ` : ''}${escapeHtml(r.reason || '')}</div>
+        </div>
+      </div>`)
+    );
+  });
+  return wrapEl;
+}
+
 function formatUptime(seconds) {
+  seconds = Math.max(0, Math.floor(seconds || 0));
+  const d = Math.floor(seconds / 86400);
+  if (d >= 1) return `${d}d ${Math.floor((seconds % 86400) / 3600)}h`;
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   if (h < 1) return `${m}m`;
@@ -288,9 +345,10 @@ async function renderUsers() {
         ${u.avatar ? `<img class="avatar" src="${u.avatar}" />` : '<div class="avatar"></div>'}
         <div class="row-main">
           <div class="row-title">${escapeHtml(u.username)}</div>
-          <div class="row-sub">${escapeHtml(u.guildName)}${u.streak ? ` · 🔥${u.streak}` : ''}</div>
+          <div class="row-sub">${escapeHtml(u.guildName)}${u.streak ? ` · 🔥${u.streak}` : ''}${u.linked ? ' · 🔐 linked' : ''}</div>
         </div>
-        ${u.addedBy ? `<div class="row-count">by ${u.addedBy}</div>` : ''}
+        ${u.trackingOff ? '<span class="badge feedback-badge-disputed">Live activity off</span>' : ''}
+        ${u.addedBy ? `<div class="row-count">by ${escapeHtml(u.addedByName || u.addedBy)}</div>` : ''}
       </div>
     `)
     );
@@ -302,9 +360,10 @@ async function renderUsers() {
 function activityRow(a) {
   return el(`
     <div class="list-row">
+      ${a.cover ? `<img class="avatar avatar-cover" src="${escapeHtml(a.cover)}" alt="" loading="lazy" />` : ''}
       <div class="row-main">
         <div class="row-title">${escapeHtml(a.animeTitle || 'Activity update')}</div>
-        <div class="row-sub">${escapeHtml(a.guildName)}${a.addedBy ? ` · tracked for ${a.addedBy}` : ''}</div>
+        <div class="row-sub">${escapeHtml(a.guildName)}${a.addedBy ? ` · tracked for ${escapeHtml(a.addedByName || a.addedBy)}` : ''}</div>
       </div>
       <div class="row-count">${timeAgo(a.postedAt)}</div>
     </div>
@@ -323,9 +382,9 @@ async function renderActivity() {
 /* ---------------- Leaderboards ---------------- */
 
 let currentTab = 'recommended';
-document.querySelectorAll('.tab').forEach((tab) => {
+document.querySelectorAll('[data-tab]').forEach((tab) => {
   tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t === tab));
+    document.querySelectorAll('[data-tab]').forEach((t) => t.classList.toggle('active', t === tab));
     currentTab = tab.dataset.tab;
     renderLeaderboard(currentTab);
   });
@@ -348,7 +407,7 @@ async function renderLeaderboard(tab) {
         <div class="list-row">
           <div class="rank">${i + 1}</div>
           <div class="row-main">
-            <div class="row-title">${item.siteUrl ? `<a href="${item.siteUrl}" target="_blank" style="color:inherit;text-decoration:none">${escapeHtml(item.title)}</a>` : escapeHtml(item.title)}</div>
+            <div class="row-title">${item.siteUrl ? `<a href="${escapeHtml(item.siteUrl)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">${escapeHtml(item.title)}</a>` : escapeHtml(item.title)}</div>
           </div>
           <div class="row-count">${item.count} ${tab === 'watched' ? 'updates' : 'votes'}</div>
         </div>
@@ -364,7 +423,7 @@ async function renderLeaderboard(tab) {
         el(`
         <div class="list-row">
           <div class="row-main">
-            <div class="row-title">${u.userId}</div>
+            <div class="row-title">${escapeHtml(u.userName || u.userId)}</div>
             <div class="row-sub">${escapeHtml(u.titles.map((t) => t.title).join(', '))}</div>
           </div>
           <div class="row-count">${u.count}</div>
@@ -376,9 +435,18 @@ async function renderLeaderboard(tab) {
     const { accounts, note } = await api('/leaderboards/linked');
     content.innerHTML = '';
     noteEl.textContent = note || '';
-    if (!accounts.length) return content.appendChild(el('<div class="empty-state">No linked AniList accounts yet — coming with /signin.</div>'));
+    if (!accounts.length) return content.appendChild(el('<div class="empty-state">No one has linked their AniList with /signin yet.</div>'));
     for (const a of accounts) {
-      content.appendChild(el(`<div class="list-row"><div class="row-main"><div class="row-title">${a.discordId}</div></div></div>`));
+      content.appendChild(
+        el(`<div class="list-row">
+          ${a.avatar ? `<img class="avatar" src="${escapeHtml(a.avatar)}" alt="" />` : '<div class="avatar"></div>'}
+          <div class="row-main">
+            <div class="row-title"><a href="${escapeHtml(a.siteUrl)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none">${escapeHtml(a.anilistName)}</a></div>
+            <div class="row-sub">Discord: ${escapeHtml(a.discordName || a.discordId)} · linked ${timeAgo(a.linkedAt)}</div>
+          </div>
+          ${a.trackingOff ? '<span class="badge feedback-badge-disputed">Live activity off</span>' : '<span class="badge feedback-badge-resolved">Live activity on</span>'}
+        </div>`)
+      );
     }
   }
 }
@@ -401,16 +469,24 @@ function feedbackCard(f) {
     ? `${'★'.repeat(f.rating)}${'☆'.repeat(5 - f.rating)} <span class="muted-note">${f.rating}/5</span>`
     : '<span class="muted-note">No rating given</span>';
   const statusLabel = FEEDBACK_STATUS_LABELS[f.status] || 'New';
+  const fromDiscord = f.source === 'discord';
+  const who = fromDiscord
+    ? `<span class="feedback-who">${f.userAvatar ? `<img class="avatar avatar-xs" src="${escapeHtml(f.userAvatar)}" alt="" />` : ''}${escapeHtml(f.userName || 'Unknown user')}${
+        f.guildName ? ` <span class="muted-note">in ${escapeHtml(f.guildName)}</span>` : ''
+      }</span>`
+    : `<span class="muted-note">Contact: ${f.contact ? escapeHtml(f.contact) : '—'}</span>`;
 
   const node = el(`
     <div class="card feedback-card">
       <div class="card-header">
         <span class="badge feedback-badge-${f.status || 'new'}">${statusLabel}</span>
-        <span class="muted-note">${timeAgo(f.postedAt)}</span>
+        <span class="badge feedback-source">${fromDiscord ? '/feedback' : 'Website'}</span>
+        <span class="muted-note feedback-time" title="${escapeHtml(new Date(f.postedAt).toLocaleString())}">${timeAgo(f.postedAt)}</span>
       </div>
       <div class="feedback-rating">${stars}</div>
+      ${f.title ? `<h3 class="feedback-title">${escapeHtml(f.title)}</h3>` : ''}
       <p class="feedback-content">${escapeHtml(f.content)}</p>
-      <p class="muted-note">Contact: ${f.contact ? escapeHtml(f.contact) : '—'}</p>
+      <div class="feedback-meta">${who}</div>
       <div class="feedback-actions"></div>
     </div>
   `);
@@ -428,7 +504,7 @@ function feedbackCard(f) {
     btn.onclick = async () => {
       btn.disabled = true;
       try {
-        await api(`/feedback/${f.messageId}/status`, { method: 'POST', body: JSON.stringify({ status }) });
+        await api(`/feedback/${encodeURIComponent(f.id)}/status`, { method: 'POST', body: JSON.stringify({ status }) });
         renderFeedback(currentFeedbackTab);
       } catch (err) {
         btn.disabled = false;
@@ -436,6 +512,22 @@ function feedbackCard(f) {
       }
     };
     actions.appendChild(btn);
+  }
+
+  if (fromDiscord) {
+    const del = el('<button class="btn btn-ghost btn-small feedback-delete">Delete</button>');
+    del.onclick = async () => {
+      if (!confirm('Delete this feedback permanently?')) return;
+      del.disabled = true;
+      try {
+        await api(`/feedback/${encodeURIComponent(f.id)}`, { method: 'DELETE' });
+        renderFeedback(currentFeedbackTab);
+      } catch (err) {
+        del.disabled = false;
+        alert(`Error: ${err.message}`);
+      }
+    };
+    actions.appendChild(del);
   }
 
   return node;

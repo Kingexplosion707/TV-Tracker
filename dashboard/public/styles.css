@@ -751,3 +751,27 @@ select {
   .skeleton::after { display: none; }
   .view-panel { animation: none; }
 }
+
+/* ---------- Additions: feedback details, restart history, covers ---------- */
+.feedback-title {
+  margin: var(--s-2) 0 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.feedback-source {
+  background: var(--surface-3);
+  color: var(--text-muted);
+}
+.feedback-time { margin: 0 0 0 auto; }
+.feedback-meta { font-size: 12px; color: var(--text-muted); }
+.feedback-who { display: inline-flex; align-items: center; gap: var(--s-3); }
+.feedback-delete { margin-left: auto; color: var(--danger); }
+.list-row img.avatar.avatar-xs,
+.avatar-xs { width: 20px; height: 20px; min-width: 20px; }
+.list-row img.avatar.avatar-cover { border-radius: var(--r-sm); width: 28px; height: 40px; object-fit: cover; }
+.restart-history { margin-top: var(--s-5); border-top: 1px solid var(--border); padding-top: var(--s-4); }
+.restart-history h3 { font-size: 13px; margin: 0 0 var(--s-3); color: var(--text-muted); font-weight: 600; }
+.text-danger { color: var(--danger); font-weight: 600; }
+.feedback-card .card-header { justify-content: flex-start; margin-bottom: var(--s-3); }
+.avatar-xs { border-radius: var(--r-full); object-fit: cover; }

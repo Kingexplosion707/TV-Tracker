@@ -2,6 +2,10 @@ const Jimp = require('jimp');
 
 const DEFAULT_COLOR = 0x3db4f2;
 
+// Small LRU-ish cache so the same cover is never downloaded + decoded twice.
+const colorCache = new Map();
+const MAX_CACHE = 300;
+
 /**
  * Downloads a small version of the image and picks the most common
  * non-extreme color as a stand-in for the "primary" color.
@@ -10,7 +14,18 @@ const DEFAULT_COLOR = 0x3db4f2;
  */
 async function getDominantColor(imageUrl) {
   if (!imageUrl) return DEFAULT_COLOR;
+  if (colorCache.has(imageUrl)) return colorCache.get(imageUrl);
+  const color = await computeDominantColor(imageUrl);
+  colorCache.set(imageUrl, color);
+  if (colorCache.size > MAX_CACHE) colorCache.delete(colorCache.keys().next().value);
+  return color;
+}
 
+// Callers should pass the SMALLEST cover size AniList offers (coverImage.medium):
+// the colour comes out the same, but decoding a full-size "extraLarge" cover
+// with Jimp briefly costs tens of MB of RAM — on Render's 512 MB free tier
+// that was a real out-of-memory (→ restart) risk.
+async function computeDominantColor(imageUrl) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);

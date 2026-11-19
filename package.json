@@ -6,16 +6,17 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "deploy-commands": "node deploy-commands.js"
+    "deploy-commands": "node deploy-commands.js",
+    "check": "node --check commands.js && node --check index.js && node --check storage.js && node --check anilist.js && node --check oauth.js && node --check moreInfo.js && node --check feedback.js && node --check deploy-commands.js && node --check dashboard/routes.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.38.2",
-    "discord.js": "^14.15.3",
+    "discord.js": "^14.27.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jimp": "^0.22.12"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   }
 }

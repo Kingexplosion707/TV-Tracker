@@ -1,45 +1,6 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName('track')
-    .setDescription("Start tracking an AniList user's activity feed")
-    .addStringOption((opt) =>
-      opt.setName('username').setDescription('AniList username').setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName('untrack')
-    .setDescription('Stop tracking an AniList user')
-    .addStringOption((opt) =>
-      opt.setName('username').setDescription('AniList username').setRequired(true)
-    ),
-  new SlashCommandBuilder().setName('list').setDescription('List AniList users currently tracked in this server'),
-  new SlashCommandBuilder()
-    .setName('setchannel')
-    .setDescription('Set the channel where AniList updates get posted')
-    .addChannelOption((opt) =>
-      opt.setName('channel').setDescription('Target text channel').setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName('watchlater')
-    .setDescription('Show your personal watch later list (private, only you see it)'),
-  new SlashCommandBuilder()
-    .setName('recommendanimes')
-    .setDescription('Show the most-recommended anime/manga in this server, ranked highest to lowest'),
-  new SlashCommandBuilder()
-    .setName('favorites')
-    .setDescription("Show a user's AniList favorites")
-    .addStringOption((opt) =>
-      opt.setName('username').setDescription('AniList username').setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName('whostracking')
-    .setDescription('List who is being tracked and by whom, without pinging anyone'),
-  new SlashCommandBuilder()
-    .setName('myfavorites')
-    .setDescription('Show your personal favorites list saved via the ❤️ Favorite button (private, only you see it)'),
-].map((c) => c.toJSON());
+const { REST, Routes } = require('discord.js');
+const { commands } = require('./commands');
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -57,10 +18,11 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     await rest.put(route, { body: commands });
 
     console.log(
-      'Slash commands registered' +
-        (process.env.GUILD_ID ? ' to your test server (instant).' : ' globally (can take up to ~1hr to show up).')
+      `Registered ${commands.length} slash commands` +
+        (process.env.GUILD_ID ? ' to your test server (instant).' : ' globally (can take up to ~1hr to show up everywhere).')
     );
   } catch (err) {
     console.error('Failed to register commands:', err);
+    process.exitCode = 1;
   }
 })();

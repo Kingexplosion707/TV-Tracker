@@ -3,58 +3,135 @@ const path = require('path');
 const express = require('express');
 const {
   Client,
+  Events,
   GatewayIntentBits,
   Partials,
   EmbedBuilder,
   PermissionFlagsBits,
+  PermissionsBitField,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
   MessageFlags,
 } = require('discord.js');
-const { loadData, saveData } = require('./storage');
+const { loadData, saveData, flushData, isStorageHealthy, backend: storageBackend } = require('./storage');
 const {
   getUserByName,
   getRecentActivities,
   getMediaById,
   getUserFavorites,
   getMediaRelations,
+  getMediaDetails,
 } = require('./anilist');
 const { getDominantColor, DEFAULT_COLOR } = require('./imageColor');
 const { buildDashboardRouter } = require('./dashboard/routes');
+const { buildOAuthRouter, signInUrlFor, isOAuthConfigured } = require('./oauth');
+const { buildMoreInfo } = require('./moreInfo');
+const feedback = require('./feedback');
+const { commands: slashCommands } = require('./commands');
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_MINUTES, 10) || 3) * 60 * 1000;
 const ANIME_ROLE_NAME = 'anime'; // server role (case-insensitive) pinged on relaunch
-const MAX_RECENT_POSTS = 300; // how many recent activity posts we remember per guild for reaction/recommend lookups
-const MAX_SEASON_HOPS = 5; // safety cap on how far back we'll walk a prequel chain
+const RELAUNCH_NOTICE_COOLDOWN_MS = 12 * 60 * 60 * 1000; // at most one "I restarted" ping per 12h
+const MAX_RECENT_POSTS = 300; // per guild, for reaction/recommend lookups
+const MAX_SEASON_HOPS = 6; // safety cap on how far back we walk a prequel chain
+const MAX_FRANCHISE_HOPS = 12; // safety cap walking a sequel chain for "More Info"
+const MAX_CACHE_ENTRIES = 1000;
+const MEDIA_DETAILS_TTL_MS = 15 * 60 * 1000;
+const REACTION_DM_DEDUPE_MS = 10 * 60 * 1000;
+const EPHEMERAL = MessageFlags.Ephemeral;
+const TV_FORMATS = new Set(['TV', 'TV_SHORT', 'ONA']);
 
-// In-memory cache of mediaId -> resolved season/root info, so we only ever
-// walk a given show's prequel chain once per bot process lifetime.
-const seasonCache = new Map();
+// What the bot needs in its posting channel. Checked before posting and when
+// a channel is chosen, so a missing permission gives a clear message instead
+// of silent failures.
+const REQUIRED_CHANNEL_PERMS = [
+  ['ViewChannel', PermissionFlagsBits.ViewChannel],
+  ['SendMessages', PermissionFlagsBits.SendMessages],
+  ['EmbedLinks', PermissionFlagsBits.EmbedLinks],
+  ['ReadMessageHistory', PermissionFlagsBits.ReadMessageHistory],
+];
+// What the invite link asks for (set the same set in the Developer Portal ->
+// Installation -> Default Install Settings).
+const INVITE_PERMISSIONS = new PermissionsBitField([
+  PermissionFlagsBits.ViewChannel,
+  PermissionFlagsBits.SendMessages,
+  PermissionFlagsBits.SendMessagesInThreads,
+  PermissionFlagsBits.EmbedLinks,
+  PermissionFlagsBits.AttachFiles,
+  PermissionFlagsBits.ReadMessageHistory,
+  PermissionFlagsBits.AddReactions,
+  PermissionFlagsBits.UseExternalEmojis,
+]);
 
-// Polling can be paused from the dashboard (Bot Controls -> Pause). The bot
-// stays online and keeps responding to slash commands/buttons either way —
-// this only gates the periodic AniList check + new activity posts. Backed
-// by data.botPaused so the state survives a restart; this in-memory flag is
-// just what pollAllGuilds actually reads each tick.
+/* ---------------------------------------------------------------------------
+ * Small bounded caches (the old season cache grew forever)
+ * ------------------------------------------------------------------------- */
+function boundedSet(map, key, value) {
+  map.set(key, value);
+  if (map.size > MAX_CACHE_ENTRIES) map.delete(map.keys().next().value);
+}
+const seasonCache = new Map(); // mediaId -> { season, rootId, rootTitle, rootSiteUrl, popularityRank }
+const franchiseCache = new Map(); // rootId -> [tv-ish media ids in order]
+const mediaDetailsCache = new Map(); // mediaId -> { at, media }
+const reactionDmSeen = new Map(); // `${msg}:${user}:${emoji}` -> timestamp
+const warnedChannels = new Set();
+
+// Polling can be paused from the dashboard. Backed by data.botPaused.
 let isPaused = false;
+let pollRunning = false;
 const botStartedAt = Date.now();
+
+/* ---------------------------------------------------------------------------
+ * Crash guards
+ *
+ * Unhandled promise rejections terminate Node by default — and Render then
+ * restarts the bot. Several code paths (un-awaited interaction replies,
+ * async Express routes, expired interactions) could produce one. These
+ * handlers log the problem instead of taking the whole bot down.
+ * ------------------------------------------------------------------------- */
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason instanceof Error ? reason.stack || reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.stack || err.message);
+});
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
-  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel, Partials.User],
 });
 
-// Render (and most free hosts) expect something listening on a port to
-// consider the service "alive". This also gives an external ping service
-// (e.g. UptimeRobot) something to hit to keep the bot from sleeping, and is
-// now also where the developer dashboard is served from.
+// An 'error' event with no listener is thrown as an exception by Node's
+// EventEmitter — another way the bot used to crash on network blips.
+client.on(Events.Error, (err) => console.error('[discord client error]', err.message));
+client.on(Events.Warn, (msg) => console.warn('[discord warn]', msg));
+client.on(Events.ShardDisconnect, (ev, id) => console.warn(`[discord] shard ${id} disconnected (${ev?.code}) — discord.js will reconnect`));
+client.on(Events.ShardReconnecting, (id) => console.warn(`[discord] shard ${id} reconnecting…`));
+client.on(Events.ShardResume, (id) => console.log(`[discord] shard ${id} resumed`));
+
+/* ---------------------------------------------------------------------------
+ * Web server: keep-alive, health, dashboard, AniList sign-in callback
+ * ------------------------------------------------------------------------- */
 const PORT = process.env.PORT || 3000;
 const app = express();
+app.disable('x-powered-by');
 
 app.get('/', (req, res) => {
-  res.type('text/plain').send('AniList Discord bot is running.');
+  res.type('text/plain').send('AniTracker is running.');
+});
+
+// Lightweight JSON for UptimeRobot / debugging restarts.
+app.get('/health', (req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    ok: true,
+    discordReady: client.isReady(),
+    storage: isStorageHealthy() ? 'ok' : 'unavailable',
+    uptimeSeconds: Math.floor((Date.now() - botStartedAt) / 1000),
+    memoryMB: Math.round(mem.rss / 1024 / 1024),
+  });
 });
 
 app.use('/dashboard', express.static(path.join(__dirname, 'dashboard', 'public')));
@@ -68,41 +145,201 @@ app.use(
       isPaused = val;
     },
     botStartedAt,
+    getInviteUrl,
+    storageBackend,
+    isStorageHealthy,
   })
 );
+app.use(buildOAuthRouter({ loadData, saveData, onLinked: sendLinkedConfirmation }));
 
-app.listen(PORT, () => console.log(`Web server (keep-alive + dashboard) listening on port ${PORT}`));
+// Last-resort Express error handler — a thrown route must never crash the process.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('[express]', req.method, req.path, err.stack || err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
+});
 
-client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+const server = app.listen(PORT, () => console.log(`Web server (keep-alive + dashboard) listening on port ${PORT}`));
+
+/* ---------------------------------------------------------------------------
+ * Boot / shutdown bookkeeping
+ * ------------------------------------------------------------------------- */
+let currentBoot = null;
+
+async function recordBoot() {
   const data = await loadData();
-  isPaused = data.botPaused; // restore pause state across restarts (e.g. after a redeploy)
+  const previous = data.bootHistory[data.bootHistory.length - 1];
+  if (previous && !previous.endedAt) {
+    // The last run never reached our shutdown handler: it was killed hard —
+    // usually Render's out-of-memory kill or a crash.
+    previous.reason = 'unexpected (crash, out-of-memory, or hard kill)';
+    console.warn('Previous run ended unexpectedly (no clean shutdown recorded). Check Render → Events/Logs around', previous.startedAt);
+  }
+  currentBoot = {
+    startedAt: new Date(botStartedAt).toISOString(),
+    endedAt: null,
+    reason: null,
+    commit: (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || null,
+  };
+  data.bootHistory.push(currentBoot);
+  await saveData(data);
+}
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received — shutting down cleanly…`);
+  const hardExit = setTimeout(() => process.exit(0), 8000);
+  hardExit.unref();
+  try {
+    if (currentBoot) {
+      currentBoot.endedAt = new Date().toISOString();
+      currentBoot.reason = signal === 'SIGTERM' ? 'clean stop (Render deploy/restart)' : `clean stop (${signal})`;
+      saveData();
+    }
+    await flushData();
+  } catch (e) {
+    console.error('Error flushing data on shutdown:', e.message);
+  }
+  server.close();
+  client.destroy();
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Memory watch: Render's free tier kills the process at 512 MB, which shows
+// up as a "random" restart. Log usage, and shed caches if it gets high.
+setInterval(() => {
+  const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  if (rssMB > 380) {
+    console.warn(`[memory] RSS ${rssMB} MB — clearing caches`);
+    seasonCache.clear();
+    franchiseCache.clear();
+    mediaDetailsCache.clear();
+  } else {
+    console.log(`[memory] RSS ${rssMB} MB`);
+  }
+}, 15 * 60 * 1000).unref();
+
+function getInviteUrl() {
+  const id = client.user?.id || process.env.CLIENT_ID;
+  if (!id) return null;
+  return `https://discord.com/oauth2/authorize?client_id=${id}&permissions=${INVITE_PERMISSIONS.bitfield}&integration_type=0&scope=bot+applications.commands`;
+}
+
+client.once(Events.ClientReady, async () => {
+  console.log(`Logged in as ${client.user.tag} — in ${client.guilds.cache.size} server(s)`);
+  console.log(`Invite link: ${getInviteUrl()}`);
+  if (!isOAuthConfigured()) {
+    console.warn('AniList sign-in is NOT configured (ANILIST_CLIENT_ID / ANILIST_CLIENT_SECRET / PUBLIC_URL). /signin will say so.');
+  }
+  // Keep Discord's global command list in sync with commands.js on every
+  // start, so new/changed commands go live with a normal deploy.
+  try {
+    await client.application.commands.set(slashCommands);
+    console.log(`Registered ${slashCommands.length} slash commands globally.`);
+  } catch (e) {
+    console.error('Failed to register slash commands:', e.message);
+  }
+
+  const data = await loadData();
+  isPaused = data.botPaused;
   if (isPaused) console.log('Polling starting in PAUSED state (resume from the dashboard to enable it).');
   pollAllGuilds();
   setInterval(pollAllGuilds, POLL_INTERVAL_MS);
   notifyRelaunch();
 });
 
-// Makes sure a guild's data object has every field newer features need,
-// even for guilds that were first tracked before those features existed.
+/* ---------------------------------------------------------------------------
+ * Helpers
+ * ------------------------------------------------------------------------- */
+
+// Makes sure a guild's data object has every field newer features need.
 function ensureGuildData(data, guildId) {
   if (!data.guilds[guildId]) {
-    data.guilds[guildId] = {
-      channelId: null,
-      users: [],
-      watchlist: {},
-      favorites: {},
-      recommendations: {},
-      recentPosts: {},
-    };
+    data.guilds[guildId] = { channelId: null, users: [], recommendations: {}, recentPosts: {} };
   }
   const guildData = data.guilds[guildId];
-  if (!guildData.watchlist) guildData.watchlist = {};
-  if (!guildData.favorites) guildData.favorites = {};
+  if (!Array.isArray(guildData.users)) guildData.users = [];
   if (!guildData.recommendations) guildData.recommendations = {};
   if (!guildData.recentPosts) guildData.recentPosts = {};
-  if (!data.globalRecommendations) data.globalRecommendations = {};
   return guildData;
+}
+
+function ensureUserLists(data, userId) {
+  if (!data.userLists[userId]) data.userLists[userId] = { watchlist: [], favorites: [] };
+  const lists = data.userLists[userId];
+  if (!Array.isArray(lists.watchlist)) lists.watchlist = [];
+  if (!Array.isArray(lists.favorites)) lists.favorites = [];
+  return lists;
+}
+
+function isOptedOut(data, anilistId) {
+  return Boolean(data.trackingOptOut[String(anilistId)]);
+}
+
+// The Discord user who "owns" a tracked profile: whoever signed in with that
+// AniList account if anyone has, otherwise whoever ran /track.
+function profileOwnerId(data, anilistId, fallbackDiscordId) {
+  for (const [discordId, acct] of Object.entries(data.linkedAccounts)) {
+    if (acct.anilistId === anilistId) return discordId;
+  }
+  return fallbackDiscordId || null;
+}
+
+function missingChannelPerms(channel) {
+  if (!channel?.guild) return [];
+  const me = channel.guild.members.me;
+  const perms = me ? channel.permissionsFor(me) : null;
+  if (!perms) return REQUIRED_CHANNEL_PERMS.map(([name]) => name);
+  return REQUIRED_CHANNEL_PERMS.filter(([, flag]) => !perms.has(flag)).map(([name]) => name);
+}
+
+function prettyPerm(name) {
+  return name.replace(/([a-z])([A-Z])/g, '$1 $2');
+}
+
+// Replies (or edits a deferred reply) without ever throwing — an expired
+// interaction must not be able to crash anything.
+async function respond(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      // Visibility is fixed when the reply/defer was created; editReply
+      // doesn't accept the Ephemeral flag, so drop it here.
+      const { flags, ...rest } = typeof payload === 'string' ? { content: payload } : payload;
+      return await interaction.editReply(rest);
+    }
+    return await interaction.reply(payload);
+  } catch (e) {
+    console.error(`Failed to respond to interaction (${interaction.customId || interaction.commandName || 'unknown'}):`, e.message);
+    return null;
+  }
+}
+
+async function safeDefer(interaction, ephemeral) {
+  try {
+    await interaction.deferReply(ephemeral ? { flags: EPHEMERAL } : {});
+    return true;
+  } catch (e) {
+    console.error('Failed to defer interaction (likely expired):', e.message);
+    return false;
+  }
+}
+
+function titleOf(media) {
+  return media?.title?.english || media?.title?.romaji || 'Unknown title';
+}
+
+function stars(n) {
+  return '★'.repeat(n) + '☆'.repeat(5 - n);
+}
+
+function signInButtonRow(userId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Sign in with AniList').setEmoji('🔐').setURL(signInUrlFor(userId))
+  );
 }
 
 async function findAnimeRole(guild) {
@@ -115,25 +352,29 @@ async function findAnimeRole(guild) {
   }
 }
 
-// Pings the @Anime role in every configured channel once on startup, so
-// people know to re-track if a restart caused anything to look stale.
+// Pings the @Anime role once on startup — but at most once every 12 hours,
+// so a burst of deploys/restarts doesn't spam every server.
 async function notifyRelaunch() {
   const data = await loadData();
+  if (Date.now() - data.lastRelaunchNoticeAt < RELAUNCH_NOTICE_COOLDOWN_MS) {
+    console.log('Skipping relaunch notice (one was sent in the last 12h).');
+    return;
+  }
+  data.lastRelaunchNoticeAt = Date.now();
+  saveData(data);
+
   for (const guildId of Object.keys(data.guilds)) {
     const guildData = ensureGuildData(data, guildId);
     if (!guildData.channelId) continue;
-
     try {
-      const guild = await client.guilds.fetch(guildId).catch(() => null);
+      const guild = client.guilds.cache.get(guildId);
       if (!guild) continue;
       const channel = await client.channels.fetch(guildData.channelId).catch(() => null);
-      if (!channel) continue;
-
+      if (!channel || missingChannelPerms(channel).length) continue;
       const animeRole = await findAnimeRole(guild);
-      if (!animeRole) continue; // no "Anime" role in this server, skip quietly
-
+      if (!animeRole) continue;
       await channel.send({
-        content: `<@&${animeRole.id}> 🔄 AniTracker just restarted. If your activity feed looks stale, you may want to re-run \`/track\` for your profile.`,
+        content: `<@&${animeRole.id}> 🔄 AniTracker just restarted. If your activity feed looks stale, re-run \`/track\` for your profile.`,
         allowedMentions: { roles: [animeRole.id] },
       });
     } catch (e) {
@@ -142,134 +383,210 @@ async function notifyRelaunch() {
   }
 }
 
-client.on('interactionCreate', async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    await handleSlashCommand(interaction);
-  } else if (interaction.isButton()) {
-    await handleButton(interaction);
-  } else if (interaction.isStringSelectMenu()) {
-    await handleSelectMenu(interaction);
+/* ---------------------------------------------------------------------------
+ * New servers: say hi with a quick start
+ * ------------------------------------------------------------------------- */
+client.on(Events.GuildCreate, async (guild) => {
+  try {
+    console.log(`Joined server: ${guild.name} (${guild.id})`);
+    const channel = guild.systemChannel;
+    if (!channel || missingChannelPerms(channel).length) return;
+    const embed = new EmbedBuilder()
+      .setColor(DEFAULT_COLOR)
+      .setTitle('✦ Thanks for adding AniTracker!')
+      .setDescription(
+        [
+          'I post AniList activity (episodes watched, chapters read, status changes) right here in Discord.',
+          '',
+          '**Quick start**',
+          '`/setchannel` — pick where updates go (needs Manage Server)',
+          '`/track username:<AniList name>` — start posting someone’s activity',
+          '`/signin` — link your own AniList so you control your live activity',
+          '`/help` — everything else',
+        ].join('\n')
+      );
+    await channel.send({ embeds: [embed] });
+  } catch (e) {
+    console.error('Failed to send welcome message:', e.message);
   }
 });
 
-// DMs the tracked profile's owner when someone reacts to their activity
-// post, and DMs the reactor a private confirmation that it happened.
-// Ignores reactions from any bot (covers an auto-reacter bot and similar).
-client.on('messageReactionAdd', async (reaction, reactingUser) => {
+/* ---------------------------------------------------------------------------
+ * Interaction router
+ * ------------------------------------------------------------------------- */
+client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (reactingUser.bot) return;
+    if (interaction.isChatInputCommand()) await handleSlashCommand(interaction);
+    else if (interaction.isButton()) await handleButton(interaction);
+    else if (interaction.isStringSelectMenu()) await handleSelectMenu(interaction);
+    else if (interaction.isModalSubmit()) await handleModalSubmit(interaction);
+  } catch (err) {
+    console.error('Unhandled error in interaction handler:', err);
+    await respond(interaction, { content: 'Something went wrong. Try again in a bit.', flags: EPHEMERAL });
+  }
+});
 
+/* ---------------------------------------------------------------------------
+ * Reaction → private DM alerts
+ * ------------------------------------------------------------------------- */
+client.on(Events.MessageReactionAdd, async (reaction, reactingUser) => {
+  try {
+    if (reactingUser.partial) reactingUser = await reactingUser.fetch().catch(() => reactingUser);
+    if (reactingUser.bot) return;
     if (reaction.partial) {
       const fetched = await reaction.fetch().catch(() => null);
       if (!fetched) return;
       reaction = fetched;
     }
-
     const message = reaction.message.partial ? await reaction.message.fetch().catch(() => null) : reaction.message;
     if (!message || !message.guild || message.author?.id !== client.user.id) return;
 
     const data = await loadData();
     const guildData = ensureGuildData(data, message.guild.id);
     const postInfo = guildData.recentPosts[message.id];
-    if (!postInfo || !postInfo.addedBy) return;
-    if (reactingUser.id === postInfo.addedBy) return; // don't notify people about their own reaction
+    if (!postInfo) return;
+
+    const ownerId = profileOwnerId(data, postInfo.anilistId, postInfo.addedBy);
+    if (!ownerId || reactingUser.id === ownerId) return; // no owner, or reacting to your own post
 
     const emojiStr = reaction.emoji.toString();
-    const animeTitle = postInfo.animeTitle || 'their activity';
 
-    // Private DM to the profile owner: who reacted and to what.
-    try {
-      const owner = await client.users.fetch(postInfo.addedBy);
-      await owner.send({
-        content: `<@${reactingUser.id}> reacted ${emojiStr} to you watching **${animeTitle}**.`,
-        allowedMentions: { parse: [] },
-      });
-    } catch (e) {
-      console.error(`Failed to DM profile owner ${postInfo.addedBy}:`, e.message);
+    // Toggling the same reaction on/off shouldn't spam DMs.
+    const dedupeKey = `${message.id}:${reactingUser.id}:${reaction.emoji.id || reaction.emoji.name}`;
+    const now = Date.now();
+    if (now - (reactionDmSeen.get(dedupeKey) || 0) < REACTION_DM_DEDUPE_MS) return;
+    reactionDmSeen.set(dedupeKey, now);
+    if (reactionDmSeen.size > 2000) reactionDmSeen.delete(reactionDmSeen.keys().next().value);
+
+    const sourceEmbed = message.embeds[0];
+    const cover = postInfo.cover || sourceEmbed?.image?.url || null;
+    const animeTitle = postInfo.animeTitle || 'your activity';
+    const animeUrl = postInfo.siteUrl || null;
+    const titleLink = animeUrl ? `[${animeTitle}](${animeUrl})` : `**${animeTitle}**`;
+    const color = sourceEmbed?.color ?? DEFAULT_COLOR;
+    const guildIcon = message.guild.iconURL({ size: 64 }) || undefined;
+    const jumpRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Jump to post').setEmoji('↗️').setURL(message.url)
+    );
+
+    const owner = await client.users.fetch(ownerId).catch(() => null);
+
+    // DM to the profile owner: who reacted, to what, and where.
+    if (owner) {
+      const embed = new EmbedBuilder()
+        .setColor(color)
+        .setAuthor({ name: `${reactingUser.displayName || reactingUser.username} reacted ${emojiStr}`, iconURL: reactingUser.displayAvatarURL({ size: 64 }) })
+        .setDescription(`<@${reactingUser.id}> reacted ${emojiStr} to you watching ${titleLink}\n\n🏠 **${message.guild.name}** · <#${message.channelId}>`)
+        .setFooter({ text: message.guild.name, iconURL: guildIcon })
+        .setTimestamp(new Date());
+      if (cover) embed.setThumbnail(cover);
+      await owner.send({ embeds: [embed], components: [jumpRow], allowedMentions: { parse: [] } }).catch((e) =>
+        console.error(`Failed to DM profile owner ${ownerId}:`, e.message)
+      );
     }
 
-    // Private DM to the reactor: confirms the alert went out, nobody else sees this.
-    try {
-      await reactingUser.send({
-        content: `<@${postInfo.addedBy}> was alerted of your reaction ${emojiStr} to **${animeTitle}**.`,
-        allowedMentions: { parse: [] },
-      });
-    } catch (e) {
-      console.error(`Failed to DM reactor ${reactingUser.id}:`, e.message);
-    }
+    // DM to the reactor: private confirmation the alert went out.
+    const confirm = new EmbedBuilder()
+      .setColor(color)
+      .setDescription(`✅ <@${ownerId}> was alerted of your ${emojiStr} on ${titleLink}\n\n🏠 **${message.guild.name}** · <#${message.channelId}>`)
+      .setFooter({ text: message.guild.name, iconURL: guildIcon })
+      .setTimestamp(new Date());
+    if (cover) confirm.setThumbnail(cover);
+    await reactingUser.send({ embeds: [confirm], components: [jumpRow], allowedMentions: { parse: [] } }).catch((e) =>
+      console.error(`Failed to DM reactor ${reactingUser.id}:`, e.message)
+    );
   } catch (e) {
     console.error('Error handling reaction notification:', e.message);
   }
 });
 
+/* ---------------------------------------------------------------------------
+ * Slash commands
+ * ------------------------------------------------------------------------- */
 async function handleSlashCommand(interaction) {
   const { commandName } = interaction;
-  const guildId = interaction.guildId;
 
-  if (!guildId) {
-    await interaction.reply({ content: 'This bot only works inside a server.', ephemeral: true });
+  if (!interaction.inGuild()) {
+    await respond(interaction, { content: 'AniTracker commands only work inside a server.', flags: EPHEMERAL });
     return;
   }
 
-  const data = await loadData();
-  const guildData = ensureGuildData(data, guildId);
+  // Modals must be shown as the very first response — do it before anything else.
+  if (commandName === 'feedback') {
+    await handleFeedbackCommand(interaction);
+    return;
+  }
+
+  const data = await loadData(); // in-memory, instant
+  const guildData = ensureGuildData(data, interaction.guildId);
 
   try {
-    if (commandName === 'track') {
-      await handleTrack(interaction, data, guildData);
-    } else if (commandName === 'untrack') {
-      await handleUntrack(interaction, data, guildData);
-    } else if (commandName === 'list') {
-      handleList(interaction, guildData);
-    } else if (commandName === 'setchannel') {
-      await handleSetChannel(interaction, data, guildData);
-    } else if (commandName === 'watchlater') {
-      handleWatchLaterList(interaction, guildData);
-    } else if (commandName === 'myfavorites') {
-      handleMyFavorites(interaction, guildData);
-    } else if (commandName === 'recommendanimes') {
-      handleRecommendAnimes(interaction, guildData, data);
-    } else if (commandName === 'favorites') {
-      await handleFavorites(interaction);
-    } else if (commandName === 'whostracking') {
-      await handleWhosTracking(interaction, guildData);
+    switch (commandName) {
+      case 'track':
+        return await handleTrack(interaction, data, guildData);
+      case 'untrack':
+        return await handleUntrack(interaction, data, guildData);
+      case 'list':
+        return await handleList(interaction, data, guildData);
+      case 'whostracking':
+        return await handleWhosTracking(interaction, data, guildData);
+      case 'setchannel':
+        return await handleSetChannel(interaction, data, guildData);
+      case 'watchlater':
+        return await handleMyList(interaction, data, 'watchlist');
+      case 'myfavorites':
+        return await handleMyList(interaction, data, 'favorites');
+      case 'recommendanimes':
+        return await handleRecommendAnimes(interaction, guildData, data);
+      case 'favorites':
+        return await handleFavorites(interaction);
+      case 'signin':
+        return await handleSignIn(interaction, data);
+      case 'signout':
+        return await handleSignOut(interaction, data);
+      case 'tracking':
+        return await handleTracking(interaction, data);
+      case 'help':
+        return await handleHelp(interaction);
+      default:
+        return await respond(interaction, { content: 'Unknown command — try `/help`.', flags: EPHEMERAL });
     }
   } catch (err) {
     console.error(`Error handling /${commandName}:`, err);
-    // Same double-failure risk as the button handlers: if reply/editReply
-    // here also fails (interaction expired between the original error and
-    // now), don't let that escape uncaught and crash the process.
-    try {
-      const payload = { content: 'Something went wrong. Try again in a bit.', ephemeral: true };
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(payload);
-      } else {
-        await interaction.reply(payload);
-      }
-    } catch (replyErr) {
-      console.error(`Failed to send error reply for /${commandName} (interaction likely expired):`, replyErr.message);
-    }
+    await respond(interaction, { content: 'Something went wrong. Try again in a bit.', flags: EPHEMERAL });
   }
 }
 
 async function handleTrack(interaction, data, guildData) {
-  const username = interaction.options.getString('username');
-  await interaction.deferReply();
+  const username = interaction.options.getString('username').trim();
+  if (!(await safeDefer(interaction, false))) return;
 
   const existing = guildData.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
   if (existing) {
-    await interaction.editReply(`Already tracking **${existing.username}**.`);
+    await respond(interaction, { content: `Already tracking **${existing.username}** in this server.`, allowedMentions: { parse: [] } });
     return;
   }
 
-  const user = await getUserByName(username);
+  let user;
+  try {
+    user = await getUserByName(username);
+  } catch (e) {
+    console.error('AniList lookup failed in /track:', e.message);
+    await respond(interaction, { content: '⚠️ AniList isn’t responding right now (this is on AniList’s side). Try again in a few minutes.' });
+    return;
+  }
   if (!user) {
-    await interaction.editReply(`Couldn't find an AniList user named **${username}**.`);
+    await respond(interaction, { content: `Couldn't find an AniList user named **${username}**.`, allowedMentions: { parse: [] } });
+    return;
+  }
+  // The exact-name check above can miss (different casing typed); check by id too.
+  if (guildData.users.some((u) => u.id === user.id)) {
+    await respond(interaction, { content: `Already tracking **${user.name}** in this server.`, allowedMentions: { parse: [] } });
     return;
   }
 
   // Record the current latest activity id so we don't dump their whole history on first track.
-  const activities = await getRecentActivities(user.id, 1);
+  const activities = await getRecentActivities(user.id, 1).catch(() => []);
   const lastActivityId = activities.length ? activities[0].id : 0;
 
   guildData.users.push({
@@ -282,111 +599,155 @@ async function handleTrack(interaction, data, guildData) {
   if (!guildData.channelId) guildData.channelId = interaction.channelId;
   await saveData(data);
 
-  await interaction.editReply(
-    `✅ Now tracking **${user.name}**'s AniList activity. New updates will post in <#${guildData.channelId}> and quietly ping <@${interaction.user.id}>.`
-  );
+  const lines = [`✅ Now tracking **[${user.name}](${user.siteUrl})**. New updates will post in <#${guildData.channelId}> and quietly ping <@${interaction.user.id}>.`];
+  const channel = await client.channels.fetch(guildData.channelId).catch(() => null);
+  const missing = missingChannelPerms(channel);
+  if (missing.length) {
+    lines.push(`\n⚠️ I can't post in <#${guildData.channelId}> yet — I'm missing **${missing.map(prettyPerm).join(', ')}** there. Fix my permissions or use \`/setchannel\`.`);
+  }
+  if (isOptedOut(data, user.id)) {
+    lines.push('\n⏸️ This profile’s owner has turned their live activity **off** (`/tracking`), so nothing will post until they turn it back on.');
+  }
+  await respond(interaction, { content: lines.join('\n'), allowedMentions: { parse: [] } });
 }
 
 async function handleUntrack(interaction, data, guildData) {
-  const username = interaction.options.getString('username');
-  const before = guildData.users.length;
-  guildData.users = guildData.users.filter((u) => u.username.toLowerCase() !== username.toLowerCase());
+  const username = interaction.options.getString('username').trim();
+  const entry = guildData.users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+  if (!entry) {
+    await respond(interaction, { content: `Wasn't tracking anyone named **${username}** here.`, flags: EPHEMERAL, allowedMentions: { parse: [] } });
+    return;
+  }
+
+  // Who may untrack: whoever started tracking it, the AniList account's real
+  // (signed-in) owner, or a server manager.
+  const linked = data.linkedAccounts[interaction.user.id];
+  const allowed =
+    entry.addedBy === interaction.user.id ||
+    (linked && linked.anilistId === entry.id) ||
+    interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+  if (!allowed) {
+    await respond(interaction, {
+      content: `Only <@${entry.addedBy}> (who started tracking **${entry.username}**), the profile's owner, or someone with **Manage Server** can untrack it.`,
+      flags: EPHEMERAL,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  guildData.users = guildData.users.filter((u) => u !== entry);
   await saveData(data);
-
-  if (guildData.users.length < before) {
-    interaction.reply(`🗑️ Stopped tracking **${username}**.`);
-  } else {
-    interaction.reply(`Wasn't tracking anyone named **${username}**.`);
-  }
+  await respond(interaction, { content: `🗑️ Stopped tracking **${entry.username}**.`, allowedMentions: { parse: [] } });
 }
 
-function handleList(interaction, guildData) {
-  if (!guildData.users.length) {
-    interaction.reply('Not tracking any AniList profiles yet. Use `/track <username>` to add one.');
-    return;
-  }
-  const channelLine = guildData.channelId ? `Posting to <#${guildData.channelId}>.\n\n` : '';
-  const list = guildData.users
-    .map((u) => `• ${u.username}${u.addedBy ? ` (pings <@${u.addedBy}>)` : ''}`)
-    .join('\n');
-  interaction.reply(`${channelLine}Tracking:\n${list}`);
+function trackedLine(data, u, trackerLabel) {
+  const paused = isOptedOut(data, u.id) ? ' ⏸️' : '';
+  const streak = u.streak > 1 ? ` · 🔥 ${u.streak}` : '';
+  return `• **[${u.username}](https://anilist.co/user/${encodeURIComponent(u.username)})**${paused}${streak}${trackerLabel ? ` — ${trackerLabel}` : ''}`;
 }
 
-// Same info as /list but with plain Discord display names instead of
-// mentions, so running it never pings anyone.
-async function handleWhosTracking(interaction, guildData) {
+async function handleList(interaction, data, guildData) {
   if (!guildData.users.length) {
-    await interaction.reply('Not tracking any AniList profiles yet.');
+    await respond(interaction, { content: 'Not tracking any AniList profiles yet. Use `/track username:<name>` to add one.' });
     return;
   }
+  const lines = guildData.users.map((u) => trackedLine(data, u, u.addedBy ? `<@${u.addedBy}>` : null));
+  const embed = new EmbedBuilder()
+    .setColor(DEFAULT_COLOR)
+    .setTitle(`📋 Tracked profiles (${guildData.users.length})`)
+    .setDescription(`${guildData.channelId ? `Posting in <#${guildData.channelId}>\n\n` : ''}${lines.join('\n')}`.slice(0, 4096))
+    .setFooter({ text: '⏸️ = owner turned live activity off' });
+  // Mentions render as names but never ping.
+  await respond(interaction, { embeds: [embed], allowedMentions: { parse: [] } });
+}
 
+// Same info as /list, but with plain display names (no mentions at all).
+async function handleWhosTracking(interaction, data, guildData) {
+  if (!guildData.users.length) {
+    await respond(interaction, { content: 'Not tracking any AniList profiles yet.' });
+    return;
+  }
+  if (!(await safeDefer(interaction, false))) return;
   const lines = await Promise.all(
     guildData.users.map(async (u) => {
       let trackerName = 'unknown';
       if (u.addedBy) {
         const member = await interaction.guild.members.fetch(u.addedBy).catch(() => null);
-        trackerName = member ? member.displayName : 'unknown';
+        trackerName = member ? member.displayName : 'someone who left';
       }
-      return `• **${u.username}** — tracked by ${trackerName}`;
+      return trackedLine(data, u, `tracked by ${trackerName}`);
     })
   );
-
-  await interaction.reply(`📋 Who's Tracking What\n${lines.join('\n')}`);
+  const embed = new EmbedBuilder()
+    .setColor(DEFAULT_COLOR)
+    .setTitle("📋 Who's tracking what")
+    .setDescription(lines.join('\n').slice(0, 4096));
+  await respond(interaction, { embeds: [embed], allowedMentions: { parse: [] } });
 }
 
 async function handleSetChannel(interaction, data, guildData) {
-  if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
-    interaction.reply({ content: 'You need the Manage Server permission to do that.', ephemeral: true });
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    await respond(interaction, { content: 'You need the **Manage Server** permission to do that.', flags: EPHEMERAL });
     return;
   }
   const channel = interaction.options.getChannel('channel');
+  if (!channel?.isTextBased?.() || channel.isVoiceBased?.()) {
+    await respond(interaction, { content: 'Pick a regular text channel.', flags: EPHEMERAL });
+    return;
+  }
+  const missing = missingChannelPerms(channel);
+  if (missing.length) {
+    await respond(interaction, {
+      content: `⚠️ I can't post in <#${channel.id}> — I'm missing **${missing.map(prettyPerm).join(', ')}** there. Give me those in the channel's permissions and run this again.`,
+      flags: EPHEMERAL,
+    });
+    return;
+  }
   guildData.channelId = channel.id;
   await saveData(data);
-  interaction.reply(`AniList updates will now post in <#${channel.id}>.`);
+  await respond(interaction, { content: `✅ AniList updates will now post in <#${channel.id}>.` });
 }
 
-function handleWatchLaterList(interaction, guildData) {
-  const list = guildData.watchlist[interaction.user.id] || [];
+// /watchlater and /myfavorites — one list per person, across every server.
+async function handleMyList(interaction, data, field) {
+  const list = ensureUserLists(data, interaction.user.id)[field];
+  const isWatch = field === 'watchlist';
+  const icon = isWatch ? '📌' : '🤍';
+  const name = isWatch ? 'Watch Later' : 'Favorites';
+
   if (!list.length) {
-    interaction.reply({
-      content: 'Your watch later list is empty. Click 📌 **Watch later** on any activity to add one!',
-      ephemeral: true,
+    await respond(interaction, {
+      content: isWatch
+        ? 'Your watch later list is empty. Click 📌 **Watch later** on any activity post to add one!'
+        : 'Your favorites list is empty. Click 🤍 **Favorite** on any activity post to add one! (Saved in AniTracker — not synced to your AniList favourites.)',
+      flags: EPHEMERAL,
     });
     return;
   }
-  const lines = list.map((e, i) => `${i + 1}. **[${e.title}](${e.siteUrl})**`).join('\n');
-  const embed = new EmbedBuilder()
-    .setColor(DEFAULT_COLOR)
-    .setTitle('📌 Your Watch Later List')
-    .setDescription(lines);
-  interaction.reply({ embeds: [embed], ephemeral: true });
-}
 
-// Bot-local favorites — saved in AniTracker's own storage only, NOT synced
-// to the person's real AniList account favorites (that would need OAuth).
-function handleMyFavorites(interaction, guildData) {
-  const list = guildData.favorites[interaction.user.id] || [];
-  if (!list.length) {
-    interaction.reply({
-      content:
-        'Your favorites list is empty. Click 🤍 **Favorite** on any activity to add one! (Saved in the bot — not synced to your real AniList favorites.)',
-      ephemeral: true,
-    });
-    return;
+  const lines = [];
+  let length = 0;
+  for (let i = 0; i < list.length; i++) {
+    const line = `\`${String(i + 1).padStart(2, ' ')}\` **[${list[i].title}](${list[i].siteUrl})**`;
+    if (length + line.length > 3800) {
+      lines.push(`…and **${list.length - i}** more`);
+      break;
+    }
+    lines.push(line);
+    length += line.length + 1;
   }
-  const lines = list.map((e, i) => `${i + 1}. **[${e.title}](${e.siteUrl})**`).join('\n');
+
   const embed = new EmbedBuilder()
     .setColor(DEFAULT_COLOR)
-    .setTitle('🤍 Your Favorites (saved in the bot)')
-    .setDescription(lines);
-  interaction.reply({ embeds: [embed], ephemeral: true });
+    .setTitle(`${icon} Your ${name} · ${list.length}`)
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: `Only you can see this • Click ${icon} again on a post to remove it${isWatch ? '' : ' • Not synced to AniList'}` });
+  if (list[0]?.cover) embed.setThumbnail(list[0].cover);
+  await respond(interaction, { embeds: [embed], flags: EPHEMERAL });
 }
 
-// Cross-server ("Global") vs this-server tallies, selectable via a dropdown
-// on the reply itself. Global entries live in data.globalRecommendations —
-// see handleRecommendButton for how a user's vote only ever counts once
-// there, no matter how many servers they recommend the same show in.
-const RECOMMEND_EMBED_COLOR = 0xff9800; // vivid orange-yellow — recommendanimes embed only
+/* ----- /recommendanimes ----- */
+const RECOMMEND_EMBED_COLOR = 0xff9800;
 
 function buildRecommendEntries(recsObj) {
   return Object.entries(recsObj || {})
@@ -419,19 +780,15 @@ function buildRecommendEmbed(scope, guildData, data) {
   const medals = ['🥇', '🥈', '🥉'];
   const totalVotes = entries.reduce((sum, e) => sum + e.count, 0);
   embed.setDescription(
-    `**${scopeLabel}**  •  ${totalVotes} total ${totalVotes === 1 ? 'vote' : 'votes'} across ${entries.length} title${
-      entries.length === 1 ? '' : 's'
-    }`
+    `**${scopeLabel}**  •  ${totalVotes} total ${totalVotes === 1 ? 'vote' : 'votes'} across ${entries.length} title${entries.length === 1 ? '' : 's'}`
   );
-
   entries.forEach((e, i) => {
     embed.addFields({
-      name: `${medals[i] || `#${i + 1}`}  ${e.title}`,
+      name: `${medals[i] || `#${i + 1}`}  ${e.title}`.slice(0, 256),
       value: `[View on AniList ↗](${e.siteUrl})\n**${e.count}** ${e.count === 1 ? 'vote' : 'votes'}`,
       inline: entries.length > 3,
     });
   });
-
   return embed;
 }
 
@@ -440,195 +797,377 @@ function buildRecommendScopeRow(scope) {
     .setCustomId('recscope')
     .setPlaceholder('Choose a scope to view')
     .addOptions(
-      {
-        label: 'This Server',
-        description: 'Recommendations made in this server',
-        value: 'guild',
-        emoji: '🏠',
-        default: scope !== 'global',
-      },
-      {
-        label: 'Global',
-        description: 'Recommendations from every server (one vote per person)',
-        value: 'global',
-        emoji: '🌍',
-        default: scope === 'global',
-      }
+      { label: 'This Server', description: 'Recommendations made in this server', value: 'guild', emoji: '🏠', default: scope !== 'global' },
+      { label: 'Global', description: 'Recommendations from every server (one vote per person)', value: 'global', emoji: '🌍', default: scope === 'global' }
     );
   return new ActionRowBuilder().addComponents(menu);
 }
 
-function handleRecommendAnimes(interaction, guildData, data) {
+async function handleRecommendAnimes(interaction, guildData, data) {
   const scope = 'guild';
-  const embed = buildRecommendEmbed(scope, guildData, data);
-  const row = buildRecommendScopeRow(scope);
-  interaction.reply({ embeds: [embed], components: [row] });
+  await respond(interaction, { embeds: [buildRecommendEmbed(scope, guildData, data)], components: [buildRecommendScopeRow(scope)] });
 }
 
-// Handles the This Server / Global dropdown on a /recommendanimes reply.
 async function handleSelectMenu(interaction) {
-  if (interaction.customId !== 'recscope') return;
-  const guildId = interaction.guildId;
-  if (!guildId) return;
+  if (interaction.customId !== 'recscope' || !interaction.guildId) return;
+  const data = await loadData();
+  const guildData = ensureGuildData(data, interaction.guildId);
+  const scope = interaction.values[0] === 'global' ? 'global' : 'guild';
+  const payload = { embeds: [buildRecommendEmbed(scope, guildData, data)], components: [buildRecommendScopeRow(scope)] };
 
+  // Only the person who ran the command switches the shared message; anyone
+  // else gets their own private copy instead of changing it for everybody.
+  const ownerId = interaction.message.interactionMetadata?.user?.id;
+  if (ownerId && ownerId !== interaction.user.id) {
+    await respond(interaction, { ...payload, flags: EPHEMERAL });
+    return;
+  }
   try {
-    const data = await loadData();
-    const guildData = ensureGuildData(data, guildId);
-    const scope = interaction.values[0] === 'global' ? 'global' : 'guild';
-    const embed = buildRecommendEmbed(scope, guildData, data);
-    const row = buildRecommendScopeRow(scope);
-    await interaction.update({ embeds: [embed], components: [row] });
-  } catch (err) {
-    console.error('Error handling recommend scope select:', err.message);
+    await interaction.update(payload);
+  } catch (e) {
+    console.error('Failed to update recommend scope:', e.message);
   }
 }
 
 async function handleFavorites(interaction) {
-  const username = interaction.options.getString('username');
-  await interaction.deferReply();
+  const username = interaction.options.getString('username').trim();
+  if (!(await safeDefer(interaction, false))) return;
 
-  const user = await getUserFavorites(username).catch(() => null);
+  let user;
+  try {
+    user = await getUserFavorites(username);
+  } catch (e) {
+    await respond(interaction, { content: '⚠️ AniList isn’t responding right now (this is on AniList’s side). Try again in a few minutes.' });
+    return;
+  }
   if (!user) {
-    await interaction.editReply(`Couldn't find an AniList user named **${username}**.`);
+    await respond(interaction, { content: `Couldn't find an AniList user named **${username}**.`, allowedMentions: { parse: [] } });
     return;
   }
 
   const animeList = user.favourites?.anime?.nodes || [];
   const mangaList = user.favourites?.manga?.nodes || [];
-
   if (!animeList.length && !mangaList.length) {
-    await interaction.editReply(`**${user.name}** hasn't favorited anything on AniList yet.`);
+    await respond(interaction, { content: `**${user.name}** hasn't favourited anything on AniList yet.`, allowedMentions: { parse: [] } });
     return;
   }
 
+  const embed = new EmbedBuilder().setColor(DEFAULT_COLOR).setTitle(`💖 ${user.name}'s Favourites`).setURL(user.siteUrl);
+  if (user.avatar?.medium) embed.setThumbnail(user.avatar.medium);
+  const fmt = (list) =>
+    list
+      .map((m, i) => `\`${i + 1}\` [${titleOf(m)}](${m.siteUrl})`)
+      .join('\n')
+      .slice(0, 1024);
+  if (animeList.length) embed.addFields({ name: '📺 Anime', value: fmt(animeList), inline: mangaList.length > 0 });
+  if (mangaList.length) embed.addFields({ name: '📖 Manga', value: fmt(mangaList), inline: animeList.length > 0 });
+  await respond(interaction, { embeds: [embed] });
+}
+
+/* ----- /signin, /signout ----- */
+async function handleSignIn(interaction, data) {
+  if (!isOAuthConfigured()) {
+    await respond(interaction, {
+      content: '🔧 AniList sign-in isn’t switched on for this bot yet — the developer still needs to finish setting it up. Check back soon!',
+      flags: EPHEMERAL,
+    });
+    return;
+  }
+  const linked = data.linkedAccounts[interaction.user.id];
+  const embed = new EmbedBuilder().setColor(DEFAULT_COLOR);
+  if (linked) {
+    embed
+      .setTitle('🔐 You’re signed in')
+      .setDescription(
+        `Linked to **[${linked.anilistName}](${linked.siteUrl})**.\n\nWant to switch accounts? Sign in again below with the other AniList account. Or use \`/signout\` to unlink.`
+      );
+    if (linked.avatar) embed.setThumbnail(linked.avatar);
+  } else {
+    embed
+      .setTitle('🔐 Sign in with AniList')
+      .setDescription(
+        [
+          'Linking proves which AniList profile is yours, so **only you** can control it — like turning your live activity on/off with `/tracking`.',
+          '',
+          '• AniTracker only reads your **username and avatar**',
+          '• It never posts, edits, or changes anything on your AniList',
+          '• The link below is personal and expires in 15 minutes — don’t share it',
+        ].join('\n')
+      );
+  }
+  embed.setFooter({ text: 'Only you can see this' });
+  await respond(interaction, { embeds: [embed], components: [signInButtonRow(interaction.user.id)], flags: EPHEMERAL });
+}
+
+async function handleSignOut(interaction, data) {
+  const linked = data.linkedAccounts[interaction.user.id];
+  if (!linked) {
+    await respond(interaction, { content: 'You’re not signed in. Use `/signin` to link your AniList account.', flags: EPHEMERAL });
+    return;
+  }
+  delete data.linkedAccounts[interaction.user.id];
+  await saveData(data);
+  const stillOff = isOptedOut(data, linked.anilistId);
+  await respond(interaction, {
+    content: `👋 Unlinked **${linked.anilistName}** from your Discord account.${
+      stillOff ? '\nYour live activity stays **off** — sign in again any time to turn it back on.' : ''
+    }`,
+    flags: EPHEMERAL,
+  });
+}
+
+async function sendLinkedConfirmation(discordUserId, account) {
+  const user = await client.users.fetch(discordUserId).catch(() => null);
+  if (!user) return;
   const embed = new EmbedBuilder()
     .setColor(DEFAULT_COLOR)
-    .setTitle(`💖 ${user.name}'s Favorites`)
-    .setURL(user.siteUrl);
-
-  if (animeList.length) {
-    embed.addFields({
-      name: '📺 Anime',
-      value: animeList
-        .map((m) => `• [${m.title.english || m.title.romaji}](${m.siteUrl})`)
-        .join('\n')
-        .slice(0, 1024),
-    });
-  }
-  if (mangaList.length) {
-    embed.addFields({
-      name: '📖 Manga',
-      value: mangaList
-        .map((m) => `• [${m.title.english || m.title.romaji}](${m.siteUrl})`)
-        .join('\n')
-        .slice(0, 1024),
-    });
-  }
-
-  await interaction.editReply({ embeds: [embed] });
+    .setTitle('✅ AniList linked')
+    .setDescription(`Your Discord account is now linked to **[${account.anilistName}](${account.siteUrl})**.\n\nUse \`/tracking\` in any server to turn your live activity posts on or off.`);
+  if (account.avatar) embed.setThumbnail(account.avatar);
+  await user.send({ embeds: [embed] }).catch(() => {});
 }
 
-async function handleButton(interaction) {
-  const guildId = interaction.guildId;
-  if (!guildId) return;
+/* ----- /tracking (live activity on/off, owner only) ----- */
+function trackedInGuilds(data, anilistId) {
+  const names = [];
+  for (const [guildId, g] of Object.entries(data.guilds)) {
+    if ((g.users || []).some((u) => u.id === anilistId)) names.push(client.guilds.cache.get(guildId)?.name || 'a server');
+  }
+  return names;
+}
 
-  const [action, mediaIdStr] = interaction.customId.split('_');
-  const mediaId = parseInt(mediaIdStr, 10);
-  if (!mediaId || !['wl', 'rec', 'fav'].includes(action)) return;
+function buildTrackingPanel(data, account) {
+  const off = isOptedOut(data, account.anilistId);
+  const servers = trackedInGuilds(data, account.anilistId);
+  const serverLine = servers.length
+    ? `Tracked in **${servers.length}** server${servers.length === 1 ? '' : 's'}: ${servers.slice(0, 10).join(', ')}${servers.length > 10 ? '…' : ''}`
+    : 'Nobody is tracking your profile right now.';
 
-  // Ack Discord's 3s interaction window FIRST, before loadData() (a network
-  // round trip to Upstash) or any other async work gets a chance to eat into
-  // it. If the defer itself fails — the interaction already expired, or
-  // Discord is having an outage — there is nothing left to send back, so log
-  // and bail instead of touching this interaction again.
-  try {
-    await interaction.deferReply({ ephemeral: true });
-  } catch (err) {
-    console.error('Failed to defer button interaction (likely expired):', err.message);
+  const embed = new EmbedBuilder()
+    .setColor(off ? 0xfb7185 : 0x34d399)
+    .setAuthor({ name: account.anilistName, iconURL: account.avatar || undefined, url: account.siteUrl })
+    .setTitle(off ? '🔴 Live activity is OFF' : '🟢 Live activity is ON')
+    .setDescription(
+      [
+        off
+          ? 'Your AniList updates are **not** being posted in any server. Turning it back on starts from your *next* update — nothing you did while it was off gets posted.'
+          : 'Your AniList updates are posted in every server tracking you.',
+        '',
+        serverLine,
+      ].join('\n')
+    )
+    .setFooter({ text: 'Only you can change this — it applies everywhere' });
+
+  const row = new ActionRowBuilder().addComponents(
+    off
+      ? new ButtonBuilder().setCustomId('trk_on').setLabel('Turn on').setEmoji('🟢').setStyle(ButtonStyle.Success)
+      : new ButtonBuilder().setCustomId('trk_off').setLabel('Turn off').setEmoji('🔴').setStyle(ButtonStyle.Danger)
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+async function setLiveActivity(data, account, on, byUserId) {
+  const key = String(account.anilistId);
+  if (on) {
+    if (!data.trackingOptOut[key]) return;
+    delete data.trackingOptOut[key];
+    // Skip anything they did while it was off: fast-forward every tracked
+    // entry for this profile to their latest activity.
+    const latest = await getRecentActivities(account.anilistId, 1).catch(() => []);
+    const latestId = latest[0]?.id;
+    if (latestId) {
+      for (const g of Object.values(data.guilds)) {
+        for (const u of g.users || []) if (u.id === account.anilistId) u.lastActivityId = Math.max(u.lastActivityId || 0, latestId);
+      }
+    }
+  } else {
+    data.trackingOptOut[key] = { since: new Date().toISOString(), by: byUserId };
+  }
+  await saveData(data);
+}
+
+async function handleTracking(interaction, data) {
+  const account = data.linkedAccounts[interaction.user.id];
+  if (!account) {
+    const embed = new EmbedBuilder()
+      .setColor(DEFAULT_COLOR)
+      .setTitle('🔐 Sign in first')
+      .setDescription(
+        'To make sure only the **real owner** of an AniList profile can turn its live activity on or off, link your AniList account first with `/signin` — then run `/tracking` again.'
+      );
+    const payload = { embeds: [embed], flags: EPHEMERAL };
+    if (isOAuthConfigured()) payload.components = [signInButtonRow(interaction.user.id)];
+    await respond(interaction, payload);
     return;
   }
+
+  const status = interaction.options.getString('status');
+  if (status === 'on' || status === 'off') {
+    if (!(await safeDefer(interaction, true))) return;
+    await setLiveActivity(data, account, status === 'on', interaction.user.id);
+  }
+  await respond(interaction, { ...buildTrackingPanel(data, account), flags: EPHEMERAL });
+}
+
+async function handleTrackingButton(interaction, on) {
+  const data = await loadData();
+  const account = data.linkedAccounts[interaction.user.id];
+  if (!account) {
+    await respond(interaction, { content: 'You need to `/signin` first.', flags: EPHEMERAL });
+    return;
+  }
+  try {
+    await interaction.deferUpdate();
+  } catch {
+    return;
+  }
+  await setLiveActivity(data, account, on, interaction.user.id);
+  await interaction.editReply(buildTrackingPanel(data, account)).catch((e) => console.error('Failed to refresh tracking panel:', e.message));
+}
+
+/* ----- /help ----- */
+async function handleHelp(interaction) {
+  const embed = new EmbedBuilder()
+    .setColor(DEFAULT_COLOR)
+    .setTitle('✦ AniTracker commands')
+    .addFields(
+      {
+        name: '📡 Tracking',
+        value: [
+          '`/track` — post someone’s AniList activity here',
+          '`/untrack` — stop tracking a profile',
+          '`/list` · `/whostracking` — who’s tracked in this server',
+          '`/setchannel` — where updates post *(Manage Server)*',
+        ].join('\n'),
+      },
+      {
+        name: '🔐 Your account',
+        value: ['`/signin` · `/signout` — link your AniList', '`/tracking` — turn your live activity on/off'].join('\n'),
+      },
+      {
+        name: '📚 Lists & discovery',
+        value: [
+          '`/watchlater` · `/myfavorites` — your private lists',
+          '`/recommendanimes` — most-recommended leaderboard',
+          '`/favorites` — anyone’s AniList favourites',
+        ].join('\n'),
+      },
+      { name: '💬 Other', value: '`/feedback` — rate AniTracker & tell the developer anything' },
+      {
+        name: '🔘 Buttons on activity posts',
+        value: '⭐ Recommend · 🤍 Favorite · 📌 Watch later · ℹ️ More info (only you see it)\nReact to a post and its owner gets a private DM.',
+      }
+    );
+  const invite = getInviteUrl();
+  const components = invite
+    ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Add AniTracker to a server').setURL(invite))]
+    : [];
+  await respond(interaction, { embeds: [embed], components, flags: EPHEMERAL });
+}
+
+/* ----- /feedback ----- */
+async function handleFeedbackCommand(interaction) {
+  const data = await loadData();
+  const last = data.feedback.find((f) => f.userId === interaction.user.id);
+  if (last && Date.now() - new Date(last.createdAt).getTime() < feedback.COOLDOWN_MS) {
+    await respond(interaction, { content: '⏳ You just sent feedback — give it a minute before sending more.', flags: EPHEMERAL });
+    return;
+  }
+  try {
+    await interaction.showModal(feedback.buildFeedbackModal());
+  } catch (e) {
+    console.error('Failed to show feedback modal:', e.message);
+    await respond(interaction, { content: 'Couldn’t open the feedback form — please try again.', flags: EPHEMERAL });
+  }
+}
+
+async function handleModalSubmit(interaction) {
+  if (interaction.customId !== feedback.MODAL_ID) return;
+  const submission = feedback.readFeedbackSubmission(interaction);
+  if (!submission) {
+    await respond(interaction, { content: 'Please fill in the rating, title and message.', flags: EPHEMERAL });
+    return;
+  }
+  const data = await loadData();
+  const entry = {
+    id: `cmd-${interaction.id}`,
+    source: 'discord',
+    ...submission,
+    userId: interaction.user.id,
+    userName: interaction.user.username,
+    userAvatar: interaction.user.displayAvatarURL({ size: 64 }),
+    guildId: interaction.guildId || null,
+    guildName: interaction.guild?.name || null,
+    createdAt: new Date().toISOString(),
+  };
+  data.feedback.unshift(entry);
+  await saveData(data);
+  console.log(`New feedback (${submission.rating}/5) from ${interaction.user.username}: ${submission.title}`);
+  await respond(interaction, { embeds: [feedback.buildThanksEmbed(entry)], flags: EPHEMERAL });
+}
+
+/* ---------------------------------------------------------------------------
+ * Buttons
+ * ------------------------------------------------------------------------- */
+async function handleButton(interaction) {
+  const { customId } = interaction;
+  if (customId === 'trk_on' || customId === 'trk_off') return handleTrackingButton(interaction, customId === 'trk_on');
+
+  if (!interaction.guildId) return;
+  const [action, idStr] = customId.split('_');
+  const mediaId = parseInt(idStr, 10);
+  if (!mediaId || !['wl', 'rec', 'fav', 'info'].includes(action)) return;
+
+  // Ack Discord's 3s window first. If that fails the interaction is gone.
+  if (!(await safeDefer(interaction, true))) return;
 
   const data = await loadData();
-  const guildData = ensureGuildData(data, guildId);
+  const guildData = ensureGuildData(data, interaction.guildId);
 
   try {
-    if (action === 'wl') {
-      await handleWatchLaterButton(interaction, data, guildData, mediaId);
-    } else if (action === 'rec') {
-      await handleRecommendButton(interaction, data, guildData, mediaId);
-    } else if (action === 'fav') {
-      await handleFavoriteButton(interaction, data, guildData, mediaId);
-    }
+    if (action === 'wl') await handleListToggleButton(interaction, data, mediaId, 'watchlist');
+    else if (action === 'fav') await handleListToggleButton(interaction, data, mediaId, 'favorites');
+    else if (action === 'rec') await handleRecommendButton(interaction, data, guildData, mediaId);
+    else if (action === 'info') await handleMoreInfoButton(interaction, mediaId);
   } catch (err) {
-    console.error('Error handling button interaction:', err);
-    // The interaction is already deferred at this point (we returned above
-    // if that failed), but editReply can still fail on its own (Discord
-    // hiccup, interaction expired in the meantime, etc.) — never let that
-    // escape uncaught, since an unhandled rejection here crashes the process.
-    try {
-      await interaction.editReply({ content: 'Something went wrong. Try again in a bit.' });
-    } catch (replyErr) {
-      console.error('Failed to send error reply for button interaction (interaction likely expired):', replyErr.message);
-    }
+    console.error(`Error handling button ${customId}:`, err);
+    await respond(interaction, { content: 'Something went wrong. Try again in a bit.' });
   }
 }
 
-async function handleWatchLaterButton(interaction, data, guildData, mediaId) {
-  const userId = interaction.user.id;
-  if (!guildData.watchlist[userId]) guildData.watchlist[userId] = [];
-  const list = guildData.watchlist[userId];
+// Watch later + Favorite share one toggle implementation; lists are per person.
+async function handleListToggleButton(interaction, data, mediaId, field) {
+  const list = ensureUserLists(data, interaction.user.id)[field];
+  const isWatch = field === 'watchlist';
   const existingIndex = list.findIndex((e) => e.mediaId === mediaId);
 
   if (existingIndex !== -1) {
-    list.splice(existingIndex, 1);
+    const [removed] = list.splice(existingIndex, 1);
     await saveData(data);
-    await interaction.editReply({ content: '🗑️ Removed from your watch later list.' });
+    await respond(interaction, {
+      content: isWatch ? `🗑️ Removed **${removed.title}** from your watch later list.` : `💔 Removed **${removed.title}** from your favorites.`,
+    });
     return;
   }
 
   const media = await getMediaById(mediaId).catch(() => null);
   if (!media) {
-    await interaction.editReply({ content: "Couldn't reach AniList to save that. Try again in a bit." });
+    await respond(interaction, { content: "⚠️ Couldn't reach AniList to save that (AniList-side hiccup). Try again in a bit." });
     return;
   }
-  const title = media.title.english || media.title.romaji;
-  list.push({ mediaId, title, siteUrl: media.siteUrl });
+  const title = titleOf(media);
+  list.push({ mediaId, title, siteUrl: media.siteUrl, cover: media.coverImage?.medium || null, addedAt: new Date().toISOString() });
   await saveData(data);
-  await interaction.editReply({ content: `📌 Added **${title}** to your watch later list.` });
-}
-
-// Bot-local favorite toggle — mirrors Watch Later exactly, separate storage.
-async function handleFavoriteButton(interaction, data, guildData, mediaId) {
-  const userId = interaction.user.id;
-  if (!guildData.favorites[userId]) guildData.favorites[userId] = [];
-  const list = guildData.favorites[userId];
-  const existingIndex = list.findIndex((e) => e.mediaId === mediaId);
-
-  if (existingIndex !== -1) {
-    list.splice(existingIndex, 1);
-    await saveData(data);
-    await interaction.editReply({ content: '💔 Removed from your favorites.' });
-    return;
-  }
-
-  const media = await getMediaById(mediaId).catch(() => null);
-  if (!media) {
-    await interaction.editReply({ content: "Couldn't reach AniList to save that. Try again in a bit." });
-    return;
-  }
-  const title = media.title.english || media.title.romaji;
-  list.push({ mediaId, title, siteUrl: media.siteUrl });
-  await saveData(data);
-  await interaction.editReply({
-    content: `🤍 Added **${title}** to your favorites. (Saved in the bot — not synced to your real AniList favorites.)`,
+  await respond(interaction, {
+    content: isWatch
+      ? `📌 Added **${title}** to your watch later list (${list.length} total) — see it with \`/watchlater\`.`
+      : `🤍 Added **${title}** to your favorites (${list.length} total) — see them with \`/myfavorites\`.`,
   });
 }
 
 async function handleRecommendButton(interaction, data, guildData, mediaId) {
   const userId = interaction.user.id;
-  if (!guildData.recommendations[mediaId]) {
-    guildData.recommendations[mediaId] = { title: null, siteUrl: null, recommendedBy: [] };
-  }
+  if (!guildData.recommendations[mediaId]) guildData.recommendations[mediaId] = { title: null, siteUrl: null, recommendedBy: [] };
   const rec = guildData.recommendations[mediaId];
   const alreadyRecommended = rec.recommendedBy.includes(userId);
 
@@ -638,18 +1177,15 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
     if (!rec.title) {
       const media = await getMediaById(mediaId).catch(() => null);
       if (media) {
-        rec.title = media.title.english || media.title.romaji;
+        rec.title = titleOf(media);
         rec.siteUrl = media.siteUrl;
       }
     }
     rec.recommendedBy.push(userId);
   }
 
-  // Global (cross-server) tally — one vote per user per anime no matter how
-  // many servers they're a member of. A user's vote only drops out of the
-  // global tally once they've un-recommended it in EVERY server they're
-  // tracked in, not just this one.
-  if (!data.globalRecommendations) data.globalRecommendations = {};
+  // Global tally — one vote per user per anime across all servers. A vote
+  // only leaves the global tally once it's removed in EVERY server.
   if (!data.globalRecommendations[mediaId]) {
     data.globalRecommendations[mediaId] = { title: rec.title, siteUrl: rec.siteUrl, recommendedBy: [] };
   }
@@ -658,87 +1194,144 @@ async function handleRecommendButton(interaction, data, guildData, mediaId) {
     globalRec.title = rec.title;
     globalRec.siteUrl = rec.siteUrl;
   }
-
   if (alreadyRecommended) {
-    const stillRecommendedElsewhere = Object.values(data.guilds).some(
-      (g) => g.recommendations?.[mediaId]?.recommendedBy?.includes(userId)
-    );
-    if (!stillRecommendedElsewhere) {
-      globalRec.recommendedBy = globalRec.recommendedBy.filter((id) => id !== userId);
-    }
+    const stillElsewhere = Object.values(data.guilds).some((g) => g.recommendations?.[mediaId]?.recommendedBy?.includes(userId));
+    if (!stillElsewhere) globalRec.recommendedBy = globalRec.recommendedBy.filter((id) => id !== userId);
   } else if (!globalRec.recommendedBy.includes(userId)) {
     globalRec.recommendedBy.push(userId);
   }
-
   await saveData(data);
 
-  // Reflect the new count on the button AND the "Recommended by N people" footer line.
+  // Refresh the count on the button + footer, keeping the post's More Info target.
   try {
     const newCount = rec.recommendedBy.length;
-    const newRow = buildActivityButtons(mediaId, newCount);
+    const infoId = findInfoIdOnMessage(interaction.message) || mediaId;
+    const editPayload = { components: [buildActivityButtons(mediaId, infoId, newCount)] };
     const existingEmbed = interaction.message.embeds[0];
-    const editPayload = { components: [newRow] };
-    if (existingEmbed) {
-      editPayload.embeds = [EmbedBuilder.from(existingEmbed).setFooter({ text: buildFooterText(newCount) })];
-    }
+    if (existingEmbed) editPayload.embeds = [EmbedBuilder.from(existingEmbed).setFooter({ text: buildFooterText(newCount) })];
     await interaction.message.edit(editPayload);
   } catch (e) {
     console.error('Failed to update recommend display:', e.message);
   }
 
-  // DM whoever's activity this was, telling them who recommended it — but only on a fresh recommend, not a removal.
+  // DM the post's owner on a fresh recommend (not a removal).
   if (!alreadyRecommended) {
-    try {
-      const postInfo = guildData.recentPosts[interaction.message.id];
-      if (postInfo && postInfo.addedBy && postInfo.addedBy !== userId) {
-        const owner = await client.users.fetch(postInfo.addedBy);
-        const animeName = rec.title || 'an anime';
-        await owner.send({
-          content: `<@${userId}> recommended **${animeName}** that you were watching!`,
-          allowedMentions: { parse: [] },
-        });
+    const postInfo = guildData.recentPosts[interaction.message.id];
+    const ownerId = postInfo ? profileOwnerId(data, postInfo.anilistId, postInfo.addedBy) : null;
+    if (ownerId && ownerId !== userId) {
+      const owner = await client.users.fetch(ownerId).catch(() => null);
+      if (owner) {
+        const animeName = rec.title || postInfo.animeTitle || 'an anime';
+        const embed = new EmbedBuilder()
+          .setColor(interaction.message.embeds[0]?.color ?? RECOMMEND_EMBED_COLOR)
+          .setAuthor({ name: `${interaction.user.displayName || interaction.user.username} recommended it ⭐`, iconURL: interaction.user.displayAvatarURL({ size: 64 }) })
+          .setDescription(`<@${userId}> recommended **${rec.siteUrl ? `[${animeName}](${rec.siteUrl})` : animeName}** that you were watching!\n\n🏠 **${interaction.guild.name}**`)
+          .setFooter({ text: interaction.guild.name, iconURL: interaction.guild.iconURL({ size: 64 }) || undefined })
+          .setTimestamp(new Date());
+        const cover = postInfo?.cover || interaction.message.embeds[0]?.image?.url;
+        if (cover) embed.setThumbnail(cover);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('Jump to post').setEmoji('↗️').setURL(interaction.message.url)
+        );
+        await owner.send({ embeds: [embed], components: [row], allowedMentions: { parse: [] } }).catch((e) => console.error('Failed to DM recommend notification:', e.message));
       }
-    } catch (e) {
-      console.error('Failed to DM recommend notification:', e.message);
     }
   }
 
-  await interaction.editReply(
-    alreadyRecommended ? 'Removed your recommendation.' : 'Thanks for the recommendation! ⭐'
+  await respond(interaction, {
+    content: alreadyRecommended ? 'Removed your recommendation.' : `Thanks for recommending **${rec.title || 'this'}**! ⭐ See the leaderboard with \`/recommendanimes\`.`,
+  });
+}
+
+function findInfoIdOnMessage(message) {
+  for (const row of message?.components || []) {
+    for (const c of row.components || []) {
+      if (c.customId?.startsWith('info_')) return parseInt(c.customId.split('_')[1], 10) || null;
+    }
+  }
+  return null;
+}
+
+/* ----- More Info ----- */
+async function getMediaDetailsCached(mediaId) {
+  const hit = mediaDetailsCache.get(mediaId);
+  if (hit && Date.now() - hit.at < MEDIA_DETAILS_TTL_MS) return hit.media;
+  const media = await getMediaDetails(mediaId);
+  if (media) boundedSet(mediaDetailsCache, mediaId, { at: Date.now(), media });
+  return media;
+}
+
+// Walks the franchise forward from its root along SEQUEL links and returns
+// the ordered list of TV-style entries (TV / TV Short / ONA) — i.e. "seasons".
+// Movies/OVAs between seasons are passed through but not counted.
+async function getFranchiseSeasonIds(rootId) {
+  if (franchiseCache.has(rootId)) return franchiseCache.get(rootId);
+  const ids = [];
+  const visited = new Set();
+  let cursor = rootId;
+  for (let hop = 0; hop < MAX_FRANCHISE_HOPS && cursor && !visited.has(cursor); hop++) {
+    visited.add(cursor);
+    const media = await getMediaRelations(cursor).catch(() => null);
+    if (!media) break;
+    if (media.type === 'ANIME' && TV_FORMATS.has(media.format)) ids.push(media.id);
+    const sequels = (media.relations?.edges || []).filter((e) => e.relationType === 'SEQUEL' && e.node?.type === 'ANIME');
+    const next = sequels.find((e) => TV_FORMATS.has(e.node.format)) || sequels[0];
+    cursor = next?.node?.id;
+  }
+  boundedSet(franchiseCache, rootId, ids);
+  return ids;
+}
+
+async function handleMoreInfoButton(interaction, mediaId) {
+  let media;
+  try {
+    media = await getMediaDetailsCached(mediaId);
+  } catch (e) {
+    console.error('More Info lookup failed:', e.message);
+  }
+  if (!media) {
+    await respond(interaction, { content: '⚠️ AniList isn’t responding right now (this is on AniList’s side). Try again in a bit.' });
+    return;
+  }
+
+  let seasonNumber = null;
+  let totalSeasons = null;
+  if (media.type === 'ANIME') {
+    try {
+      const { rootId } = await resolveSeasonInfo(mediaId, titleOf(media), media.siteUrl, media.type);
+      const seasonIds = await getFranchiseSeasonIds(rootId);
+      if (seasonIds.length) {
+        totalSeasons = seasonIds.length;
+        const idx = seasonIds.indexOf(mediaId);
+        seasonNumber = idx === -1 ? null : idx + 1;
+      }
+    } catch (e) {
+      console.error('Season count failed:', e.message);
+    }
+  }
+
+  await respond(interaction, buildMoreInfo(media, { seasonNumber, totalSeasons }));
+}
+
+/* ---------------------------------------------------------------------------
+ * Activity post building
+ * ------------------------------------------------------------------------- */
+function buildActivityButtons(rootId, infoMediaId, recommendCount = 0) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`rec_${rootId}`)
+      .setLabel(recommendCount ? `Recommend • ${recommendCount}` : 'Recommend')
+      .setEmoji('⭐')
+      .setStyle(ButtonStyle.Primary),
+    // Discord has no pink button colour — Danger (red) is the closest.
+    new ButtonBuilder().setCustomId(`fav_${rootId}`).setLabel('Favorite').setEmoji('🤍').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`wl_${rootId}`).setLabel('Watch later').setEmoji('📌').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`info_${infoMediaId || rootId}`).setLabel('More Info').setEmoji('ℹ️').setStyle(ButtonStyle.Secondary)
   );
 }
 
-function buildActivityButtons(mediaId, recommendCount = 0) {
-  // Order: Recommend, Favorite, Watch later.
-  const recommendBtn = new ButtonBuilder()
-    .setCustomId(`rec_${mediaId}`)
-    .setLabel(recommendCount ? `Recommend • ${recommendCount}` : 'Recommend')
-    .setEmoji('⭐')
-    .setStyle(ButtonStyle.Primary); // blue
-
-  // Discord only offers 5 built-in button colors (blurple/grey/green/red/link)
-  // — there's no true pink — so Danger (red) is the closest stand-in here.
-  const favoriteBtn = new ButtonBuilder()
-    .setCustomId(`fav_${mediaId}`)
-    .setLabel('Favorite')
-    .setEmoji('🤍')
-    .setStyle(ButtonStyle.Danger);
-
-  const watchLaterBtn = new ButtonBuilder()
-    .setCustomId(`wl_${mediaId}`)
-    .setLabel('Watch later')
-    .setEmoji('📌')
-    .setStyle(ButtonStyle.Secondary);
-
-  return new ActionRowBuilder().addComponents(recommendBtn, favoriteBtn, watchLaterBtn);
-}
-
-// Only mentions the recommend count when there's actually at least one — an
-// empty "Recommended by 0 people" line would just be clutter.
 function buildFooterText(recommendCount) {
-  if (recommendCount > 0) {
-    return `Recommended by ${recommendCount} ${recommendCount === 1 ? 'person' : 'people'} • AniList`;
-  }
+  if (recommendCount > 0) return `Recommended by ${recommendCount} ${recommendCount === 1 ? 'person' : 'people'} • AniList`;
   return 'AniList';
 }
 
@@ -754,15 +1347,12 @@ function statusEmoji(status) {
   return '📺';
 }
 
-// A clean, standalone verb for the caption line — independent of AniList's
-// raw status phrasing, so it combines predictably with our own
-// "season X, episode Y" wording.
 function statusVerbShort(status) {
   const s = (status || '').toLowerCase();
   if (s.includes('complet')) return 'Completed';
   if (s.includes('drop')) return 'Dropped';
   if (s.includes('paus')) return 'Paused';
-  if (s.includes('plan')) return 'Plans to watch';
+  if (s.includes('plan')) return s.includes('read') ? 'Plans to read' : 'Plans to watch';
   if (s.includes('rewatch')) return 'Rewatched';
   if (s.includes('reread')) return 'Reread';
   if (s.includes('watch')) return 'Watched';
@@ -774,8 +1364,6 @@ function capitalize(s) {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-// Pulls "#N Most Popular All Time" from a Media's rankings array, only
-// returning it if N <= 100 (anything past that isn't worth showing).
 function getPopularityRank(rankings) {
   if (!rankings) return null;
   const entry = rankings.find((r) => r.type === 'POPULAR' && r.allTime);
@@ -783,35 +1371,38 @@ function getPopularityRank(rankings) {
   return entry.rank;
 }
 
-// Walks AniList's actual PREQUEL relation chain to find the true root entry
-// of a franchise (e.g. Season 1) — correct even when each season has a
-// completely different title, unlike guessing from title text. Everywhere
-// downstream (embed title, Watch Later, Recommend, buttons) uses this root
-// identity, so different seasons of the same show consolidate into one
-// consistent entry instead of being tracked separately. Capped at
-// MAX_SEASON_HOPS API calls per uncached show, and cached in-memory
-// afterward so a show's info is only ever resolved once per bot uptime.
-async function resolveSeasonInfo(mediaId, fallbackTitle, fallbackSiteUrl) {
+// Walks AniList's PREQUEL chain to the franchise root (e.g. Season 1).
+// Everything downstream (title link, Watch Later, Recommend) keys on the
+// root, so seasons consolidate. Season number counts TV-style entries only,
+// so a movie between seasons doesn't shift "season 2" to "season 3".
+async function resolveSeasonInfo(mediaId, fallbackTitle, fallbackSiteUrl, mediaType) {
   if (seasonCache.has(mediaId)) return seasonCache.get(mediaId);
 
-  let season = 1;
+  let tvCount = 0;
+  let currentIsTv = false;
   let rootId = mediaId;
   let rootTitle = fallbackTitle;
   let rootSiteUrl = fallbackSiteUrl;
   let rootRankings = null;
+  let lookupFailed = false;
 
   let cursorId = mediaId;
   for (let hop = 0; hop < MAX_SEASON_HOPS; hop++) {
     const media = await getMediaRelations(cursorId).catch(() => null);
-    if (!media) break;
-    if (hop === 0) rootRankings = media.rankings || null; // in case this entry turns out to already be the root
-
-    const edges = media.relations?.edges;
-    if (!edges) break;
-    const prequel = edges.find((e) => e.relationType === 'PREQUEL');
+    if (!media) {
+      lookupFailed = hop === 0;
+      break;
+    }
+    if (hop === 0) {
+      rootRankings = media.rankings || null;
+      currentIsTv = media.type === 'ANIME' && TV_FORMATS.has(media.format);
+      if (currentIsTv) tvCount = 1;
+    }
+    const type = media.type || mediaType;
+    const prequel = (media.relations?.edges || []).find((e) => e.relationType === 'PREQUEL' && (!type || e.node?.type === type));
     if (!prequel) break;
 
-    season += 1;
+    if (TV_FORMATS.has(prequel.node.format)) tvCount += 1;
     rootId = prequel.node.id;
     rootTitle = prequel.node.title?.english || prequel.node.title?.romaji || rootTitle;
     rootSiteUrl = prequel.node.siteUrl || rootSiteUrl;
@@ -820,13 +1411,14 @@ async function resolveSeasonInfo(mediaId, fallbackTitle, fallbackSiteUrl) {
   }
 
   const result = {
-    season: season > 1 ? season : null,
+    season: currentIsTv && tvCount > 1 ? tvCount : null,
     rootId,
     rootTitle,
     rootSiteUrl,
     popularityRank: getPopularityRank(rootRankings),
   };
-  seasonCache.set(mediaId, result);
+  // Don't cache a result that only exists because AniList was down.
+  if (!lookupFailed) boundedSet(seasonCache, mediaId, result);
   return result;
 }
 
@@ -834,189 +1426,199 @@ function stripMarkup(text) {
   return (text || '')
     .replace(/img\d*\(.*?\)/g, '')
     .replace(/webm\(.*?\)/g, '')
+    .replace(/youtube\(.*?\)/g, '')
+    .replace(/~!.*?!~/gs, '')
     .replace(/[_*~`]/g, '')
     .trim();
 }
 
-// Cleans AniList's plain-text media descriptions: drops leftover HTML tags
-// and, importantly, strips ~!spoiler!~ tagged segments entirely so we never
-// accidentally post spoilers into a public channel (Discord doesn't parse
-// that AniList-specific spoiler syntax, so it would otherwise show in full).
 function stripDescription(text) {
   if (!text) return '';
   return text
     .replace(/~!.*?!~/gs, '')
     .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<\/?(i|b|em|strong|p)>/gi, '')
+    .replace(/<\/?[a-z][^>]*>/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 function truncate(text, max) {
   if (!text) return '';
-  return text.length > max ? `${text.slice(0, max)}…` : text;
+  return text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
+}
+
+// "season 2, episode 5" / "episodes 3 - 5" / "chapter 120"
+function progressText(activity, season) {
+  const isManga = activity.media?.type === 'MANGA';
+  const parts = [];
+  if (season && !isManga) parts.push(`season ${season}`);
+  if (activity.progress) {
+    const range = String(activity.progress).includes('-');
+    const unit = isManga ? (range ? 'chapters' : 'chapter') : range ? 'episodes' : 'episode';
+    parts.push(`${unit} ${activity.progress}`);
+  }
+  return parts.join(', ');
 }
 
 async function buildEmbed(username, avatarUrl, activity, streak, seasonInfo) {
   const embed = new EmbedBuilder().setTimestamp(new Date(activity.createdAt * 1000));
-
-  // Author's url applies to its ENTIRE name text as one clickable unit —
-  // there's no way to link just the username and exclude the streak from
-  // that click region within a single field. Keeping them together here is
-  // also the only way to have the streak appear on the same row as the
-  // avatar icon, since that icon only exists in the Author field.
-  const authorOpts = {
-    name: `✦ ${username} 🔥 ${streak || 1}`,
-    url: `https://anilist.co/user/${username}`,
-  };
+  const authorOpts = { name: `✦ ${username} 🔥 ${streak || 1}`, url: `https://anilist.co/user/${encodeURIComponent(username)}` };
   if (avatarUrl) authorOpts.iconURL = avatarUrl;
   embed.setAuthor(authorOpts);
 
-  if (activity.__typename === 'ListActivity') {
+  if (activity.__typename === 'ListActivity' && activity.media) {
     const { season, rootTitle, rootSiteUrl, popularityRank } = seasonInfo;
-
-    const subParts = [];
-    if (season) subParts.push(`season ${season}`);
-    if (activity.progress) subParts.push(`episode ${activity.progress}`);
-    const progressSuffix = subParts.join(', ');
-    const captionLine = progressSuffix
-      ? `${statusVerbShort(activity.status)} ${progressSuffix} ${statusEmoji(activity.status)}`
-      : `${statusVerbShort(activity.status)} ${statusEmoji(activity.status)}`;
-
-    // "# " header markdown renders bigger than embed Title styling and,
-    // unlike Title, supports being a link without forcing an underline.
-    // Uses the resolved ROOT title/link (e.g. always "Attack on Titan"),
-    // not this specific season's own AniList title/page.
+    const progress = progressText(activity, season);
+    const verb = statusVerbShort(activity.status);
+    const captionLine = `${progress ? `${verb} ${progress}` : verb} ${statusEmoji(activity.status)}`;
+    // "# " header renders bigger than Title and doesn't force an underline.
     const headerLine = `# [${rootTitle}](${rootSiteUrl})`;
 
-    // Portrait cover art — already the largest size AniList provides
-    // ("extraLarge"). Worth noting: even a genuinely higher-resolution
-    // source wouldn't render any bigger in Discord, since Discord caps the
-    // embed image's display width itself regardless of the source file's
-    // resolution — the platform, not the source, is the real ceiling here.
-    const displayImage =
-      activity.media.coverImage.extraLarge || activity.media.coverImage.large || activity.media.coverImage.medium;
-    const color = await getDominantColor(displayImage);
+    const cover = activity.media.coverImage || {};
+    const displayImage = cover.extraLarge || cover.large || cover.medium;
+    const color = await getDominantColor(cover.medium || cover.large || displayImage);
 
     const infoBits = [];
-    if (typeof activity.media.averageScore === 'number' && activity.media.averageScore !== null) {
-      infoBits.push(`⭐ ${(activity.media.averageScore / 10).toFixed(1)}/10`);
-    }
-    if (activity.media.genres && activity.media.genres.length) {
-      infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
-    }
+    if (typeof activity.media.averageScore === 'number') infoBits.push(`⭐ ${(activity.media.averageScore / 10).toFixed(1)}/10`);
+    if (activity.media.genres?.length) infoBits.push(`🎭 ${activity.media.genres.slice(0, 3).join(', ')}`);
     if (activity.media.isAdult) infoBits.push('🔞 Mature');
     if (popularityRank) infoBits.push(`❤️ #${popularityRank} Most Popular`);
     const infoLine = infoBits.join('  •  ');
 
     const synopsis = truncate(stripDescription(activity.media.description), 160);
-
     const descParts = [`${captionLine}\n${headerLine}`];
     if (infoLine) descParts.push(infoLine);
     if (synopsis) descParts.push(synopsis);
     embed.setDescription(descParts.join('\n\n'));
 
-    embed
-      .setColor(color)
-      .setImage(displayImage)
-      .setFooter({ text: buildFooterText(0) }); // fresh post, nobody's recommended it yet
+    embed.setColor(color).setFooter({ text: buildFooterText(0) });
+    if (displayImage) embed.setImage(displayImage);
   } else if (activity.__typename === 'TextActivity') {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a status update')
       .setURL(activity.siteUrl)
-      .setDescription(truncate(stripMarkup(activity.text), 300))
+      .setDescription(truncate(stripMarkup(activity.text), 300) || '*(image or media post)*')
       .setFooter({ text: 'AniList' });
   } else if (activity.__typename === 'MessageActivity') {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('💬 Posted a message')
       .setURL(activity.siteUrl)
-      .setDescription(truncate(stripMarkup(activity.message), 300))
+      .setDescription(truncate(stripMarkup(activity.message), 300) || '*(image or media post)*')
       .setFooter({ text: 'AniList' });
   } else {
     embed
       .setColor(DEFAULT_COLOR)
       .setTitle('📺 New AniList activity')
-      .setURL(`https://anilist.co/user/${username}`)
+      .setURL(`https://anilist.co/user/${encodeURIComponent(username)}`)
       .setFooter({ text: 'AniList' });
   }
   return embed;
 }
 
+/* ---------------------------------------------------------------------------
+ * Poller
+ * ------------------------------------------------------------------------- */
 async function pollAllGuilds() {
-  if (isPaused) return; // paused from the dashboard — skip this tick entirely
+  if (isPaused || !client.isReady()) return;
+  // If a poll is still running (slow AniList), don't start a second one on
+  // top of it — overlapping polls used to double-post the same activity.
+  if (pollRunning) {
+    console.warn('Previous poll still running — skipping this tick.');
+    return;
+  }
+  pollRunning = true;
+  const started = Date.now();
+  try {
+    await pollOnce();
+  } catch (e) {
+    console.error('Poll failed:', e.stack || e.message);
+  } finally {
+    pollRunning = false;
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    if (Date.now() - started > 60000) console.warn(`Poll took ${secs}s`);
+  }
+}
 
+async function pollOnce() {
   const data = await loadData();
+  // Same AniList profile tracked in several servers → fetch it once per poll.
+  const activityCache = new Map();
+  const fetchActivities = (anilistId) => {
+    if (!activityCache.has(anilistId)) activityCache.set(anilistId, getRecentActivities(anilistId, 10));
+    return activityCache.get(anilistId);
+  };
+
   let changed = false;
 
   for (const guildId of Object.keys(data.guilds)) {
+    if (isPaused) break;
     const guildData = ensureGuildData(data, guildId);
     if (!guildData.channelId || !guildData.users.length) continue;
+    if (!client.guilds.cache.has(guildId)) continue; // bot was removed from this server
 
     const channel = await client.channels.fetch(guildData.channelId).catch(() => null);
     if (!channel) continue;
+    const missing = missingChannelPerms(channel);
+    if (missing.length) {
+      if (!warnedChannels.has(channel.id)) {
+        warnedChannels.add(channel.id);
+        console.warn(`Can't post in #${channel.name} (${guildId}) — missing ${missing.join(', ')}. Skipping until fixed.`);
+      }
+      continue;
+    }
+    warnedChannels.delete(channel.id);
 
-    for (const user of guildData.users) {
+    for (const user of [...guildData.users]) {
+      if (isOptedOut(data, user.id)) continue; // owner turned live activity off
       try {
-        const activities = await getRecentActivities(user.id, 10);
-        const newOnes = activities.filter((a) => a.id > user.lastActivityId).sort((a, b) => a.id - b.id);
+        const activities = await fetchActivities(user.id);
+        const newOnes = activities.filter((a) => a.id > (user.lastActivityId || 0)).sort((a, b) => a.id - b.id);
+        if (!newOnes.length) continue;
 
-        // Daily streak: counts up if there was activity yesterday and today,
-        // resets to 1 if a day was skipped. Computed once per poll batch
-        // (not per activity) so multiple updates in one day don't double-count.
-        if (newOnes.length) {
-          const today = new Date().toISOString().slice(0, 10);
-          if (user.lastActivityDate !== today) {
-            const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-            user.streak = user.lastActivityDate === yesterday ? (user.streak || 0) + 1 : 1;
-            user.lastActivityDate = today;
-          }
+        // Daily streak (UTC days), once per poll batch.
+        const today = new Date().toISOString().slice(0, 10);
+        if (user.lastActivityDate !== today) {
+          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+          user.streak = user.lastActivityDate === yesterday ? (user.streak || 0) + 1 : 1;
+          user.lastActivityDate = today;
         }
 
         for (const activity of newOnes) {
           let seasonInfo = null;
-          if (activity.__typename === 'ListActivity') {
-            const fallbackTitle = activity.media.title.english || activity.media.title.romaji;
-            seasonInfo = await resolveSeasonInfo(activity.media.id, fallbackTitle, activity.media.siteUrl);
-
-            // "Most Watched" leaderboard on the dashboard: a global (cross-server),
-            // ever-growing tally of how many activity updates a title has produced.
-            // Keyed by the same resolved root id used everywhere else so seasons
-            // of one show accumulate together.
+          if (activity.__typename === 'ListActivity' && activity.media) {
+            seasonInfo = await resolveSeasonInfo(activity.media.id, titleOf(activity.media), activity.media.siteUrl, activity.media.type);
             const key = String(seasonInfo.rootId);
             const entry = data.watchStats[key] || { title: seasonInfo.rootTitle, siteUrl: seasonInfo.rootSiteUrl, count: 0 };
             entry.count += 1;
             entry.title = seasonInfo.rootTitle;
             entry.siteUrl = seasonInfo.rootSiteUrl;
             data.watchStats[key] = entry;
-            changed = true;
           }
 
           const embed = await buildEmbed(user.username, user.avatar, activity, user.streak, seasonInfo);
-          const content = user.addedBy ? `<@${user.addedBy}>` : undefined;
-          const components = seasonInfo ? [buildActivityButtons(seasonInfo.rootId, 0)] : [];
+          const components = seasonInfo ? [buildActivityButtons(seasonInfo.rootId, activity.media.id, 0)] : [];
 
           const sentMessage = await channel.send({
-            content,
+            content: user.addedBy ? `<@${user.addedBy}>` : undefined,
             embeds: [embed],
             components,
-            allowedMentions: user.addedBy ? { users: [user.addedBy] } : undefined,
-            // Ping quietly: shows normally in the channel, but doesn't trigger
-            // a push notification/sound for the mentioned tracker.
+            allowedMentions: user.addedBy ? { users: [user.addedBy] } : { parse: [] },
+            // Quiet ping: shows the mention, no push notification/sound.
             flags: user.addedBy ? MessageFlags.SuppressNotifications : undefined,
           });
 
-          // Remember this post so a later reaction/recommend can be traced back to who to notify.
           guildData.recentPosts[sentMessage.id] = {
             addedBy: user.addedBy || null,
+            anilistId: user.id,
             animeTitle: seasonInfo ? seasonInfo.rootTitle : null,
+            siteUrl: seasonInfo ? seasonInfo.rootSiteUrl : null,
+            mediaId: activity.media?.id || null,
+            cover: activity.media?.coverImage?.large || activity.media?.coverImage?.medium || null,
           };
-          changed = true;
-        }
-
-        if (newOnes.length) {
-          user.lastActivityId = Math.max(...newOnes.map((a) => a.id));
+          // Advance per activity, so a failure halfway never re-posts the earlier ones.
+          user.lastActivityId = Math.max(user.lastActivityId || 0, activity.id);
           changed = true;
         }
       } catch (e) {
@@ -1024,14 +1626,10 @@ async function pollAllGuilds() {
       }
     }
 
-    // Keep recentPosts from growing forever. Discord message IDs are
-    // snowflakes (roughly chronological, all-digit), so sorted key order
-    // here is effectively oldest-to-newest — trimming the front removes
-    // the oldest entries.
+    // Keep recentPosts bounded (insertion order is chronological).
     const postKeys = Object.keys(guildData.recentPosts);
     if (postKeys.length > MAX_RECENT_POSTS) {
-      const excess = postKeys.length - MAX_RECENT_POSTS;
-      for (let i = 0; i < excess; i++) delete guildData.recentPosts[postKeys[i]];
+      for (const k of postKeys.slice(0, postKeys.length - MAX_RECENT_POSTS)) delete guildData.recentPosts[k];
       changed = true;
     }
   }
@@ -1039,4 +1637,27 @@ async function pollAllGuilds() {
   if (changed) await saveData(data);
 }
 
-client.login(process.env.DISCORD_TOKEN);
+/* ---------------------------------------------------------------------------
+ * Start
+ * ------------------------------------------------------------------------- */
+(async () => {
+  if (!process.env.DISCORD_TOKEN) {
+    console.error('DISCORD_TOKEN is not set — cannot log in.');
+    return;
+  }
+  await loadData(); // warm the in-memory store before anything can touch it
+  await recordBoot();
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+  } catch (e) {
+    console.error('Discord login failed:', e.message);
+    // Exit so Render restarts us instead of sitting there half-alive.
+    await flushData();
+    process.exit(1);
+  }
+})();
+
+// Exposed only so the handlers can be exercised in isolation; unused at runtime.
+module.exports = {
+  _internals: { client, app, handleSlashCommand, handleButton, handleModalSubmit, handleSelectMenu, pollOnce, buildEmbed, resolveSeasonInfo, getFranchiseSeasonIds },
+};
